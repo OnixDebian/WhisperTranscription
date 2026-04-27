@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Whisper Transcription
+GenericName=Audio Transcription
+Comment=Transcribe audio and video with OpenAI Whisper
+Exec=__EXEC__ %f
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=transcribe;whisper;subtitle;audio;speech;
+MimeType=audio/wav;audio/mpeg;audio/mp3;audio/x-wav;audio/ogg;audio/flac;audio/x-flac;audio/x-m4a;audio/aac;audio/opus;video/mp4;video/x-matroska;video/webm;video/quicktime;
+StartupNotify=true
+StartupWMClass=whisper-transcription-arch

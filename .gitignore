@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.log
+
+# Local helpers / dev tooling
+.claude/
+.specify/
+gcp/
+
+# User data
+*.transcript
