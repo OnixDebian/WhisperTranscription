@@ -14,10 +14,15 @@ launcher that reads `.desktop` files.
 - Live system bar — total / available RAM and CPU count; pre-flight warning
   if the chosen model is unlikely to fit in available RAM
 - CPU thread cap with the upper bound matching `nproc`
+- Optional **hard RAM cap** via `systemd-run --user --scope -p MemoryMax=NG`
+  (kernel OOM-kills the worker if exceeded — clean and instant)
+- Transcription runs in an isolated subprocess, so **Cancel kills the
+  worker process** instead of trying to interrupt PyTorch from the GUI
+  thread (the previous QThread-based approach hung the app)
 - Theme palette pulled from Omarchy
   (`~/.config/omarchy/current/theme/colors.toml`), with a Tokyo Night
   fallback for non-Omarchy systems
-- Live progress while transcribing (runs in a worker thread; cancellable)
+- Live progress while transcribing (cancellable)
 - Save result as **TXT / SRT / VTT / JSON** or **Copy to clipboard**
 - Settings dialog: download or delete cached models, see disk usage
 
@@ -75,16 +80,16 @@ To remove:
 
 ## Notes
 
-- Cancelling a running job uses `QThread.terminate()` because
-  `whisper.transcribe` is not interruptible. The worker is fully owned by the
-  app, so this is safe in this context but avoid spamming it.
-- RAM is **not** hard-capped by the app: an earlier version used `RLIMIT_AS`,
-  but PyTorch reserves much more virtual address space than its actual RSS,
-  so any reasonable cap killed loading even small models with
-  `Cannot allocate memory`. The picker now shows live available RAM and
-  warns before starting if the chosen model is unlikely to fit. If you need
-  a real hard cap, wrap the launcher in
-  `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0`.
+- Transcription runs in `whisper_transcribe_worker.py` as a child process.
+  Cancel sends `SIGTERM` (then `SIGKILL` after 2 s) to that process — the
+  GUI never has to interrupt PyTorch in-process, which previously hung the
+  app for tens of seconds and could leave a zombie.
+- The hard RAM cap uses `systemd-run --user --scope -p MemoryMax=NG
+  -p MemorySwapMax=0`. On overrun the worker is `SIGKILL`-ed by the kernel
+  (exit 137); the GUI surfaces this with a clear OOM hint.
+- The earlier `RLIMIT_AS`-based cap was dropped because PyTorch reserves
+  much more virtual address space than its actual RSS, so any reasonable
+  value killed model loading with `Cannot allocate memory`.
 - The app forces `fp16=False` because Whisper on CPU uses fp32 anyway.
 
 ## License

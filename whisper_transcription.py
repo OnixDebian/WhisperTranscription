@@ -15,15 +15,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QProcess, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QGuiApplication, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -344,41 +346,148 @@ def build_stylesheet(t: dict) -> str:
     """
 
 
-# --- Worker threads -----------------------------------------------------
+# --- Subprocess worker --------------------------------------------------
 
-class TranscribeWorker(QThread):
+WORKER_SCRIPT = Path(__file__).resolve().parent / "whisper_transcribe_worker.py"
+
+
+def _systemd_run_available() -> bool:
+    return shutil.which("systemd-run") is not None
+
+
+class TranscribeProcess(QObject):
+    """Runs the transcription in an isolated subprocess.
+
+    Why a process and not a thread:
+    - whisper.transcribe is a long C++/PyTorch call. Aborting it from the GUI
+      via QThread.terminate() leaves the runtime in a broken state and has
+      hung the app in practice. Killing a child process is clean.
+    - With ram_cap_gb > 0 we wrap in `systemd-run --user --scope` to enforce
+      a real cgroup memory limit (RLIMIT_AS does not work because PyTorch
+      reserves far more virtual address space than its actual RSS).
+    """
+
     progress = pyqtSignal(str)
     finished_ok = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, file_path: str, model_name: str, cpu_threads: int, language: str | None):
-        super().__init__()
-        self.file_path = file_path
-        self.model_name = model_name
-        self.cpu_threads = cpu_threads
-        self.language = language
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.proc = QProcess(self)
+        self.proc.readyReadStandardError.connect(self._on_stderr)
+        self.proc.finished.connect(self._on_finished)
+        self.proc.errorOccurred.connect(self._on_error)
+        self._stderr_buf = ""
+        self._stderr_log: list[str] = []
+        self._cancelled = False
 
-    def run(self) -> None:
-        try:
-            self.progress.emit(f"Loading model {self.model_name}…")
-            import torch
-            torch.set_num_threads(max(1, self.cpu_threads))
-            os.environ.setdefault("OMP_NUM_THREADS", str(self.cpu_threads))
-            os.environ.setdefault("MKL_NUM_THREADS", str(self.cpu_threads))
-            import whisper
+    def start(
+        self,
+        file_path: str,
+        model: str,
+        cpu_threads: int,
+        language: str | None,
+        ram_cap_gb: int = 0,
+    ) -> None:
+        self._stderr_buf = ""
+        self._stderr_log.clear()
+        self._cancelled = False
 
-            model = whisper.load_model(self.model_name, device="cpu")
-            self.progress.emit("Transcribing… (this may take a while)")
-            result = model.transcribe(
-                self.file_path,
-                language=self.language or None,
-                fp16=False,
-                verbose=False,
+        cfg = json.dumps({
+            "file": file_path,
+            "model": model,
+            "cpu_threads": cpu_threads,
+            "language": language or "",
+        })
+
+        py = sys.executable or "python3"
+        worker_args = [str(WORKER_SCRIPT)]
+
+        if ram_cap_gb > 0 and _systemd_run_available():
+            program = "systemd-run"
+            args = [
+                "--user", "--scope", "--quiet", "--collect",
+                "-p", f"MemoryMax={ram_cap_gb}G",
+                "-p", "MemorySwapMax=0",
+                "--", py, *worker_args,
+            ]
+        else:
+            program = py
+            args = worker_args
+
+        self.proc.setProgram(program)
+        self.proc.setArguments(args)
+        self.proc.start()
+        if not self.proc.waitForStarted(5000):
+            self.failed.emit(f"Failed to start worker: {self.proc.errorString()}")
+            return
+        self.proc.write(cfg.encode("utf-8"))
+        self.proc.closeWriteChannel()
+
+    def cancel(self) -> None:
+        if self.proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._cancelled = True
+        self.proc.terminate()
+        if not self.proc.waitForFinished(2000):
+            self.proc.kill()
+            self.proc.waitForFinished(2000)
+
+    def is_running(self) -> bool:
+        return self.proc.state() != QProcess.ProcessState.NotRunning
+
+    # --- internals ------------------------------------------------------
+    def _on_stderr(self) -> None:
+        data = bytes(self.proc.readAllStandardError()).decode("utf-8", errors="replace")
+        self._stderr_buf += data
+        while "\n" in self._stderr_buf:
+            line, self._stderr_buf = self._stderr_buf.split("\n", 1)
+            line = line.rstrip()
+            if not line:
+                continue
+            if line.startswith("[STATUS] "):
+                self.progress.emit(line[len("[STATUS] "):])
+            else:
+                self._stderr_log.append(line)
+
+    def _on_error(self, _err) -> None:
+        # QProcess error — actual handling happens in _on_finished.
+        pass
+
+    def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        # Drain any remaining stderr.
+        self._on_stderr()
+        if self._stderr_buf.strip():
+            self._stderr_log.append(self._stderr_buf.strip())
+            self._stderr_buf = ""
+
+        if self._cancelled:
+            self.failed.emit("Cancelled.")
+            return
+
+        if exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
+            tail = "\n".join(self._stderr_log[-30:]).strip()
+            hint = ""
+            # systemd-run kills via signal when MemoryMax is hit.
+            if exit_code in (137, 9):
+                hint = "\n\nThe process was killed (likely OOM under the RAM cap)."
+            elif exit_status == QProcess.ExitStatus.CrashExit:
+                hint = "\n\nThe worker crashed."
+            self.failed.emit(
+                f"Worker exited (code {exit_code}).{hint}\n\n{tail or '(no stderr output)'}"
             )
+            return
+
+        try:
+            data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+            if not data.strip():
+                self.failed.emit("Worker produced no output.")
+                return
+            result = json.loads(data)
             self.finished_ok.emit(result)
         except Exception as e:
-            tb = traceback.format_exc()
-            self.failed.emit(f"{e}\n\n{tb}")
+            tail = "\n".join(self._stderr_log[-30:]).strip()
+            self.failed.emit(f"Failed to parse worker output: {e}\n\n{tail}")
 
 
 class DownloadWorker(QThread):
@@ -638,7 +747,10 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self.current_file: str | None = None
         self.last_result: dict | None = None
-        self.worker: TranscribeWorker | None = None
+        self.worker = TranscribeProcess(self)
+        self.worker.progress.connect(self._on_worker_progress)
+        self.worker.finished_ok.connect(self.on_transcribe_done)
+        self.worker.failed.connect(self.on_transcribe_failed)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -698,6 +810,30 @@ class MainWindow(QMainWindow):
         default_cpu = self.settings.get("cpu_threads", max(1, cpus // 2))
         self.cpu_spin.setValue(min(default_cpu, cpus))
         form.addRow(QLabel(f"CPU threads (1 – {cpus} available):"), self.cpu_spin)
+
+        # Hard RAM cap (systemd-run --user --scope -p MemoryMax=NG)
+        ram_total_int = max(1, int(total_ram_gb()))
+        ram_row = QHBoxLayout()
+        self.ram_cap_check = QCheckBox("Hard RAM cap")
+        self.ram_cap_check.setEnabled(_systemd_run_available())
+        if not _systemd_run_available():
+            self.ram_cap_check.setToolTip("systemd-run not found")
+        self.ram_cap_check.setChecked(bool(self.settings.get("ram_cap_enabled", False)))
+        self.ram_cap_spin = QSpinBox()
+        self.ram_cap_spin.setRange(1, ram_total_int)
+        self.ram_cap_spin.setSuffix(" GB")
+        self.ram_cap_spin.setValue(min(self.settings.get("ram_cap_gb", max(2, ram_total_int // 2)), ram_total_int))
+        self.ram_cap_spin.setEnabled(self.ram_cap_check.isChecked())
+        self.ram_cap_check.toggled.connect(self.ram_cap_spin.setEnabled)
+        ram_row.addWidget(self.ram_cap_check)
+        ram_row.addWidget(self.ram_cap_spin)
+        ram_hint = QLabel("(killed if exceeded)")
+        ram_hint.setProperty("role", "muted")
+        ram_row.addWidget(ram_hint)
+        ram_row.addStretch(1)
+        ram_widget = QWidget()
+        ram_widget.setLayout(ram_row)
+        form.addRow(QLabel(f"RAM cap (1 – {ram_total_int} GB):"), ram_widget)
 
         self.lang_edit = QLineEdit()
         self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
@@ -840,6 +976,8 @@ class MainWindow(QMainWindow):
             return
         cpu_threads = self.cpu_spin.value()
         language = self.lang_edit.text().strip() or None
+        ram_cap_enabled = self.ram_cap_check.isChecked() and _systemd_run_available()
+        ram_cap_gb = self.ram_cap_spin.value() if ram_cap_enabled else 0
 
         # Pre-flight RAM check (advisory, not enforced)
         ram_need = next((r for n, _, r in MODELS if n == model_name), 0.0)
@@ -855,11 +993,23 @@ class MainWindow(QMainWindow):
             )
             if ok != QMessageBox.StandardButton.Yes:
                 return
+        if ram_cap_enabled and ram_cap_gb < ram_need:
+            ok = QMessageBox.warning(
+                self, "Cap below model need",
+                f"You set the hard RAM cap to {ram_cap_gb} GB but {model_name} "
+                f"needs ~{ram_need:.0f} GB. The kernel will OOM-kill the worker. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ok != QMessageBox.StandardButton.Yes:
+                return
 
         self.settings.update({
             "model": model_name,
             "cpu_threads": cpu_threads,
             "language": language or "",
+            "ram_cap_enabled": ram_cap_enabled,
+            "ram_cap_gb": self.ram_cap_spin.value(),
         })
         save_settings(self.settings)
 
@@ -869,17 +1019,15 @@ class MainWindow(QMainWindow):
         self.copy_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
 
-        self.worker = TranscribeWorker(self.current_file, model_name, cpu_threads, language)
-        self.worker.progress.connect(self.statusBar().showMessage)
-        self.worker.finished_ok.connect(self.on_transcribe_done)
-        self.worker.failed.connect(self.on_transcribe_failed)
-        self.worker.start()
+        self.worker.start(self.current_file, model_name, cpu_threads, language, ram_cap_gb)
+
+    def _on_worker_progress(self, msg: str) -> None:
+        self.statusBar().showMessage(msg)
 
     def cancel_transcription(self) -> None:
-        if self.worker and self.worker.isRunning():
-            # whisper.transcribe is not interruptible; we terminate the QThread.
-            self.worker.terminate()
-            self.worker.wait(2000)
+        if self.worker.is_running():
+            self.statusBar().showMessage("Cancelling…")
+            self.worker.cancel()
             self.statusBar().showMessage("Cancelled")
         self.set_running(False)
 
