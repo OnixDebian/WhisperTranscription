@@ -186,9 +186,12 @@ def build_stylesheet(t: dict) -> str:
     fg = t["foreground"]
     accent = t.get("accent") or t.get("color4", "#7aa2f7")
     sel_fg = t.get("selection_foreground", bg)
-    border = t.get("color8", "#444b6a")
+    border = t.get("color8", "#444b6a")          # structural lines only
+    muted = t.get("color7", "#787c99")           # readable secondary text
     surface = t.get("color0", "#32344a")
+    surface_hi = t.get("color8", "#444b6a")      # hover surface
     danger = t.get("color1", "#f7768e")
+    success = t.get("color2", "#9ece6a")
     return f"""
     QMainWindow, QDialog, QWidget {{
         background: {bg};
@@ -196,8 +199,8 @@ def build_stylesheet(t: dict) -> str:
         font-size: 10pt;
     }}
     QLabel {{ background: transparent; color: {fg}; }}
-    QLabel[role="muted"] {{ color: {border}; }}
-    QLabel[role="warning"] {{ color: {danger}; }}
+    QLabel[role="muted"] {{ color: {muted}; }}
+    QLabel[role="warning"] {{ color: {danger}; font-weight: 600; }}
     QGroupBox {{
         border: 1px solid {border};
         border-radius: 8px;
@@ -211,64 +214,128 @@ def build_stylesheet(t: dict) -> str:
         padding: 0 6px;
         color: {accent};
     }}
+
+    /* Buttons — terminal-bright text, clear hover */
     QPushButton {{
         background: {surface};
         color: {fg};
-        border: 1px solid {border};
+        border: 1px solid {muted};
         border-radius: 6px;
-        padding: 6px 14px;
+        padding: 7px 16px;
+        font-weight: 500;
     }}
-    QPushButton:hover {{ background: {accent}; color: {sel_fg}; border-color: {accent}; }}
-    QPushButton:pressed {{ background: {accent}; color: {sel_fg}; }}
-    QPushButton:disabled {{ color: {border}; border-color: {border}; background: {bg}; }}
+    QPushButton:hover {{
+        background: {accent};
+        color: {sel_fg};
+        border-color: {accent};
+    }}
+    QPushButton:pressed {{
+        background: {muted};
+        color: {sel_fg};
+        border-color: {muted};
+    }}
+    QPushButton:focus {{ outline: none; border-color: {accent}; }}
+    QPushButton:disabled {{
+        color: {muted};
+        border-color: {border};
+        background: {bg};
+    }}
     QPushButton[role="primary"] {{
-        background: {accent}; color: {sel_fg}; border-color: {accent}; font-weight: 600;
+        background: {accent}; color: {sel_fg}; border-color: {accent}; font-weight: 700;
     }}
     QPushButton[role="primary"]:hover {{ background: {fg}; color: {bg}; border-color: {fg}; }}
-    QPushButton[role="primary"]:disabled {{ background: {surface}; color: {border}; border-color: {border}; }}
+    QPushButton[role="primary"]:disabled {{
+        background: {surface}; color: {muted}; border-color: {border};
+    }}
+
+    /* Inputs */
     QLineEdit, QTextEdit, QSpinBox {{
         background: {bg};
         color: {fg};
         border: 1px solid {border};
         border-radius: 6px;
-        padding: 4px 6px;
+        padding: 5px 8px;
         selection-background-color: {accent};
         selection-color: {sel_fg};
     }}
     QLineEdit:focus, QTextEdit:focus, QSpinBox:focus {{ border-color: {accent}; }}
+    QLineEdit, QTextEdit {{ placeholder-text-color: {muted}; }}
     QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; }}
+
     QProgressBar {{
         background: {surface}; color: {fg};
         border: 1px solid {border}; border-radius: 6px;
-        text-align: center; min-height: 18px;
+        text-align: center; min-height: 18px; font-weight: 600;
     }}
     QProgressBar::chunk {{ background: {accent}; border-radius: 4px; }}
+
     QStatusBar {{ background: {surface}; color: {fg}; }}
+    QStatusBar QLabel {{ color: {fg}; }}
     QMenuBar {{ background: {bg}; color: {fg}; }}
+    QMenuBar::item {{ padding: 4px 10px; background: transparent; }}
     QMenuBar::item:selected {{ background: {accent}; color: {sel_fg}; }}
-    QMenu {{ background: {surface}; color: {fg}; border: 1px solid {border}; }}
+    QMenu {{ background: {surface}; color: {fg}; border: 1px solid {border}; padding: 4px; }}
+    QMenu::item {{ padding: 6px 18px; }}
     QMenu::item:selected {{ background: {accent}; color: {sel_fg}; }}
     QHeaderView::section {{ background: {surface}; color: {fg}; border: 0; padding: 6px; }}
-    QTableWidget {{ background: {bg}; color: {fg}; gridline-color: {border}; border: 1px solid {border}; border-radius: 6px; }}
-    QScrollArea {{ border: 0; background: transparent; }}
+    QTableWidget {{
+        background: {bg}; color: {fg};
+        gridline-color: {border};
+        border: 1px solid {border}; border-radius: 6px;
+    }}
     QRadioButton {{ background: transparent; color: {fg}; }}
 
+    /* Scroll area + modern thin scrollbars (no ancient arrows) */
+    QScrollArea {{ border: 0; background: transparent; }}
+    QScrollBar:vertical {{
+        background: transparent;
+        width: 10px;
+        margin: 2px 0 2px 6px;
+    }}
+    QScrollBar:horizontal {{
+        background: transparent;
+        height: 10px;
+        margin: 6px 2px 0 2px;
+    }}
+    QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+        background: {border};
+        border-radius: 5px;
+        min-height: 24px;
+        min-width: 24px;
+    }}
+    QScrollBar::handle:hover {{ background: {muted}; }}
+    QScrollBar::handle:pressed {{ background: {accent}; }}
+    QScrollBar::add-line, QScrollBar::sub-line {{
+        height: 0; width: 0; background: transparent; border: 0;
+    }}
+    QScrollBar::up-arrow, QScrollBar::down-arrow,
+    QScrollBar::left-arrow, QScrollBar::right-arrow {{
+        background: transparent; width: 0; height: 0;
+    }}
+    QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+
+    /* Model cards */
     ModelCard {{
         background: {surface};
         border: 1px solid {border};
         border-radius: 8px;
     }}
+    ModelCard:hover {{ border-color: {muted}; background: {surface_hi}; }}
     ModelCard[selected="true"] {{
         border: 2px solid {accent};
         background: {bg};
     }}
-    ModelCard[downloaded="true"] QLabel#status {{ color: {t.get("color2", "#9ece6a")}; }}
-    ModelCard[downloaded="false"] QLabel#status {{ color: {border}; }}
+    ModelCard[selected="true"]:hover {{ border-color: {accent}; background: {bg}; }}
+    ModelCard QLabel {{ color: {fg}; }}
+    ModelCard[downloaded="true"] QLabel#status {{ color: {success}; font-weight: 600; }}
+    ModelCard[downloaded="false"] QLabel#status {{ color: {muted}; }}
+
     DropLabel {{
         border: 2px dashed {border};
         border-radius: 8px;
-        color: {border};
+        color: {muted};
         padding: 18px;
+        font-weight: 500;
     }}
     DropLabel[hasFile="true"] {{
         border-color: {accent};
@@ -375,10 +442,11 @@ class ModelCard(QFrame):
         self.setProperty("selected", "false")
         self.setProperty("downloaded", "false")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(12)
 
         self.radio = QRadioButton()
         self.radio.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -577,9 +645,11 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setSpacing(10)
 
-        # System info bar (live)
+        # System info bar (live) — kept bright like terminal text
         self.sys_info = QLabel()
-        self.sys_info.setProperty("role", "muted")
+        f = self.sys_info.font()
+        f.setBold(True)
+        self.sys_info.setFont(f)
         root.addWidget(self.sys_info)
         self._sys_timer = QTimer(self)
         self._sys_timer.timeout.connect(self._refresh_sys_info)
