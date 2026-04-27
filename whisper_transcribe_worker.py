@@ -7,10 +7,11 @@ Spawned by the main GUI as an isolated subprocess so that:
   `systemd-run --user --scope -p MemoryMax=NG -p MemorySwapMax=0 -- python3 ...`.
 
 Protocol:
-  stdin  : single JSON object — {file, model, cpu_threads, language?}
+  stdin  : single JSON object — {file, model, cpu_threads, language?, result_path}
   stderr : human progress, one per line, prefixed `[STATUS] `
-  stdout : final transcription result as a single JSON document
-  exit 0 : success, stdout contains JSON
+  result : written as JSON to `result_path` (NOT stdout — too easy for
+           torch / whisper / tqdm to pollute stdout in a child process).
+  exit 0 : success, result_path is readable
   exit 1 : failure, stderr contains traceback
 """
 from __future__ import annotations
@@ -33,6 +34,15 @@ def main() -> int:
         return 2
     cfg = json.loads(raw)
 
+    result_path = cfg.get("result_path")
+    if not result_path:
+        emit("ERROR: missing result_path in config")
+        return 2
+
+    # Belt & braces: redirect stdout to stderr so any stray print from
+    # torch / whisper / tqdm cannot mix into the parent's stdout pipe.
+    sys.stdout = sys.stderr
+
     cpu = max(1, int(cfg.get("cpu_threads", 1)))
     os.environ["OMP_NUM_THREADS"] = str(cpu)
     os.environ["MKL_NUM_THREADS"] = str(cpu)
@@ -53,8 +63,8 @@ def main() -> int:
         verbose=False,
     )
 
-    json.dump(result, sys.stdout, ensure_ascii=False)
-    sys.stdout.flush()
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False)
     emit("Done")
     return 0
 

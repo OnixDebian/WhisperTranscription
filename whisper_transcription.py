@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
@@ -431,6 +432,7 @@ class TranscribeProcess(QObject):
         self._stderr_buf = ""
         self._stderr_log: list[str] = []
         self._cancelled = False
+        self._result_path: str | None = None
 
     def start(
         self,
@@ -444,11 +446,17 @@ class TranscribeProcess(QObject):
         self._stderr_log.clear()
         self._cancelled = False
 
+        # Result is written to a tempfile by the worker, not piped via
+        # stdout — pipes can race or be polluted by stray torch/tqdm output.
+        fd, self._result_path = tempfile.mkstemp(prefix="whisper-result-", suffix=".json")
+        os.close(fd)
+
         cfg = json.dumps({
             "file": file_path,
             "model": model,
             "cpu_threads": cpu_threads,
             "language": language or "",
+            "result_path": self._result_path,
         })
 
         py = sys.executable or "python3"
@@ -512,33 +520,42 @@ class TranscribeProcess(QObject):
             self._stderr_log.append(self._stderr_buf.strip())
             self._stderr_buf = ""
 
-        if self._cancelled:
-            self.failed.emit("Cancelled.")
-            return
-
-        if exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
-            tail = "\n".join(self._stderr_log[-30:]).strip()
-            hint = ""
-            # systemd-run kills via signal when MemoryMax is hit.
-            if exit_code in (137, 9):
-                hint = "\n\nThe process was killed (likely OOM under the RAM cap)."
-            elif exit_status == QProcess.ExitStatus.CrashExit:
-                hint = "\n\nThe worker crashed."
-            self.failed.emit(
-                f"Worker exited (code {exit_code}).{hint}\n\n{tail or '(no stderr output)'}"
-            )
-            return
+        result_path = self._result_path
+        self._result_path = None
 
         try:
-            data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", errors="replace")
-            if not data.strip():
-                self.failed.emit("Worker produced no output.")
+            if self._cancelled:
+                self.failed.emit("Cancelled.")
                 return
-            result = json.loads(data)
-            self.finished_ok.emit(result)
-        except Exception as e:
-            tail = "\n".join(self._stderr_log[-30:]).strip()
-            self.failed.emit(f"Failed to parse worker output: {e}\n\n{tail}")
+
+            if exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
+                tail = "\n".join(self._stderr_log[-30:]).strip()
+                hint = ""
+                # systemd-run kills via signal when MemoryMax is hit.
+                if exit_code in (137, 9):
+                    hint = "\n\nThe process was killed (likely OOM under the RAM cap)."
+                elif exit_status == QProcess.ExitStatus.CrashExit:
+                    hint = "\n\nThe worker crashed."
+                self.failed.emit(
+                    f"Worker exited (code {exit_code}).{hint}\n\n{tail or '(no stderr output)'}"
+                )
+                return
+
+            try:
+                if not result_path or not Path(result_path).exists():
+                    raise FileNotFoundError("worker did not write the result file")
+                with open(result_path, "r", encoding="utf-8") as f:
+                    result = json.load(f)
+                self.finished_ok.emit(result)
+            except Exception as e:
+                tail = "\n".join(self._stderr_log[-30:]).strip()
+                self.failed.emit(f"Failed to read worker result: {e}\n\n{tail}")
+        finally:
+            if result_path:
+                try:
+                    Path(result_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 class DownloadWorker(QThread):
