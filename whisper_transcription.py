@@ -263,6 +263,30 @@ def build_stylesheet(t: dict) -> str:
     QLineEdit:focus, QTextEdit:focus, QSpinBox:focus {{ border-color: {accent}; }}
     QLineEdit, QTextEdit {{ placeholder-text-color: {muted}; }}
     QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; }}
+    /* Disabled inputs: dashed border + muted text + no spin arrows so it
+       reads as "not editable" instead of "looks editable but ignored". */
+    QLineEdit:disabled, QTextEdit:disabled, QSpinBox:disabled {{
+        color: {muted};
+        background: {bg};
+        border: 1px dashed {border};
+    }}
+    QSpinBox:disabled::up-button, QSpinBox:disabled::down-button {{
+        width: 0; height: 0; border: none; background: transparent;
+    }}
+    QCheckBox {{ color: {fg}; spacing: 8px; }}
+    QCheckBox::indicator {{
+        width: 16px; height: 16px;
+        border: 1px solid {muted};
+        border-radius: 4px;
+        background: {bg};
+    }}
+    QCheckBox::indicator:hover {{ border-color: {accent}; }}
+    QCheckBox::indicator:checked {{
+        background: {accent};
+        border-color: {accent};
+    }}
+    QCheckBox:disabled {{ color: {muted}; }}
+    QCheckBox:disabled::indicator {{ border-color: {border}; background: {bg}; }}
 
     QProgressBar {{
         background: {surface}; color: {fg};
@@ -809,11 +833,20 @@ class MainWindow(QMainWindow):
         self.cpu_spin.setRange(1, cpus)
         default_cpu = self.settings.get("cpu_threads", max(1, cpus // 2))
         self.cpu_spin.setValue(min(default_cpu, cpus))
-        form.addRow(QLabel(f"CPU threads (1 – {cpus} available):"), self.cpu_spin)
+        self.cpu_spin.setFixedWidth(110)
+        self.cpu_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        cpu_row = QHBoxLayout()
+        cpu_row.setContentsMargins(0, 0, 0, 0)
+        cpu_row.addWidget(self.cpu_spin)
+        cpu_row.addStretch(1)
+        cpu_wrap = QWidget()
+        cpu_wrap.setLayout(cpu_row)
+        form.addRow(QLabel(f"CPU threads (1 – {cpus} available):"), cpu_wrap)
 
         # Hard RAM cap (systemd-run --user --scope -p MemoryMax=NG)
         ram_total_int = max(1, int(total_ram_gb()))
         ram_row = QHBoxLayout()
+        ram_row.setContentsMargins(0, 0, 0, 0)
         self.ram_cap_check = QCheckBox("Hard RAM cap")
         self.ram_cap_check.setEnabled(_systemd_run_available())
         if not _systemd_run_available():
@@ -823,6 +856,8 @@ class MainWindow(QMainWindow):
         self.ram_cap_spin.setRange(1, ram_total_int)
         self.ram_cap_spin.setSuffix(" GB")
         self.ram_cap_spin.setValue(min(self.settings.get("ram_cap_gb", max(2, ram_total_int // 2)), ram_total_int))
+        self.ram_cap_spin.setFixedWidth(110)
+        self.ram_cap_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.ram_cap_spin.setEnabled(self.ram_cap_check.isChecked())
         self.ram_cap_check.toggled.connect(self.ram_cap_spin.setEnabled)
         ram_row.addWidget(self.ram_cap_check)
