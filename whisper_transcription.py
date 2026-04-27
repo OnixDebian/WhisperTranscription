@@ -835,21 +835,31 @@ class MainWindow(QMainWindow):
         self.cpu_spin.setValue(min(default_cpu, cpus))
         self.cpu_spin.setFixedWidth(110)
         self.cpu_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.cpu_spin.setToolTip(f"1 – {cpus} available")
         cpu_row = QHBoxLayout()
         cpu_row.setContentsMargins(0, 0, 0, 0)
         cpu_row.addWidget(self.cpu_spin)
         cpu_row.addStretch(1)
         cpu_wrap = QWidget()
         cpu_wrap.setLayout(cpu_row)
-        form.addRow(QLabel(f"CPU threads (1 – {cpus} available):"), cpu_wrap)
+        cpu_label = QLabel("CPU threads:")
+        cpu_label.setToolTip(f"1 – {cpus} available on this machine")
+        form.addRow(cpu_label, cpu_wrap)
 
-        # Hard RAM cap (systemd-run --user --scope -p MemoryMax=NG)
+        # Hard RAM cap (systemd-run --user --scope -p MemoryMax=NG).
+        # One full-width row so the checkbox + spin always fits — no second
+        # form-label column to compete for horizontal space.
         ram_total_int = max(1, int(total_ram_gb()))
         ram_row = QHBoxLayout()
         ram_row.setContentsMargins(0, 0, 0, 0)
-        self.ram_cap_check = QCheckBox("Hard RAM cap")
-        self.ram_cap_check.setEnabled(_systemd_run_available())
+        ram_row.setSpacing(8)
+        self.ram_cap_check = QCheckBox(f"Hard RAM cap (max {ram_total_int} GB)")
+        self.ram_cap_check.setToolTip(
+            "Wraps the worker in `systemd-run --user --scope -p MemoryMax=NG "
+            "-p MemorySwapMax=0`. The kernel OOM-kills the worker if exceeded."
+        )
         if not _systemd_run_available():
+            self.ram_cap_check.setEnabled(False)
             self.ram_cap_check.setToolTip("systemd-run not found")
         self.ram_cap_check.setChecked(bool(self.settings.get("ram_cap_enabled", False)))
         self.ram_cap_spin = QSpinBox()
@@ -859,16 +869,14 @@ class MainWindow(QMainWindow):
         self.ram_cap_spin.setFixedWidth(110)
         self.ram_cap_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.ram_cap_spin.setEnabled(self.ram_cap_check.isChecked())
+        self.ram_cap_spin.setToolTip("Killed by the kernel if exceeded")
         self.ram_cap_check.toggled.connect(self.ram_cap_spin.setEnabled)
         ram_row.addWidget(self.ram_cap_check)
         ram_row.addWidget(self.ram_cap_spin)
-        ram_hint = QLabel("(killed if exceeded)")
-        ram_hint.setProperty("role", "muted")
-        ram_row.addWidget(ram_hint)
         ram_row.addStretch(1)
         ram_widget = QWidget()
         ram_widget.setLayout(ram_row)
-        form.addRow(QLabel(f"RAM cap (1 – {ram_total_int} GB):"), ram_widget)
+        form.addRow(ram_widget)
 
         self.lang_edit = QLineEdit()
         self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
