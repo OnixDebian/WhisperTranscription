@@ -262,7 +262,34 @@ def build_stylesheet(t: dict) -> str:
     }}
     QLineEdit:focus, QTextEdit:focus, QSpinBox:focus {{ border-color: {accent}; }}
     QLineEdit, QTextEdit {{ placeholder-text-color: {muted}; }}
-    QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; }}
+
+    /* Spin box: explicit minimum height + 11pt font so the value reads on
+       Wayland. Buttons are styled (surface bg, accent on hover) but the
+       arrow images are left to Qt's active style — drawing arrows via
+       Qt-stylesheet "border tricks" is unreliable across Qt versions. */
+    QSpinBox {{
+        font-size: 11pt;
+        min-height: 26px;
+    }}
+    QSpinBox::up-button {{
+        subcontrol-origin: padding;
+        subcontrol-position: top right;
+        width: 22px;
+        border-left: 1px solid {border};
+        border-top-right-radius: 5px;
+        background: {surface};
+    }}
+    QSpinBox::down-button {{
+        subcontrol-origin: padding;
+        subcontrol-position: bottom right;
+        width: 22px;
+        border-left: 1px solid {border};
+        border-bottom-right-radius: 5px;
+        background: {surface};
+    }}
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {accent}; }}
+    QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background: {muted}; }}
+
     /* Disabled inputs: dashed border + muted text + no spin arrows so it
        reads as "not editable" instead of "looks editable but ignored". */
     QLineEdit:disabled, QTextEdit:disabled, QSpinBox:disabled {{
@@ -271,7 +298,7 @@ def build_stylesheet(t: dict) -> str:
         border: 1px dashed {border};
     }}
     QSpinBox:disabled::up-button, QSpinBox:disabled::down-button {{
-        width: 0; height: 0; border: none; background: transparent;
+        width: 0; border: none; background: transparent;
     }}
     QCheckBox {{ color: {fg}; spacing: 8px; }}
     QCheckBox::indicator {{
@@ -833,7 +860,7 @@ class MainWindow(QMainWindow):
         self.cpu_spin.setRange(1, cpus)
         default_cpu = self.settings.get("cpu_threads", max(1, cpus // 2))
         self.cpu_spin.setValue(min(default_cpu, cpus))
-        self.cpu_spin.setFixedWidth(110)
+        self.cpu_spin.setFixedWidth(140)
         self.cpu_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.cpu_spin.setToolTip(f"1 – {cpus} available")
         cpu_row = QHBoxLayout()
@@ -866,7 +893,7 @@ class MainWindow(QMainWindow):
         self.ram_cap_spin.setRange(1, ram_total_int)
         self.ram_cap_spin.setSuffix(" GB")
         self.ram_cap_spin.setValue(min(self.settings.get("ram_cap_gb", max(2, ram_total_int // 2)), ram_total_int))
-        self.ram_cap_spin.setFixedWidth(110)
+        self.ram_cap_spin.setFixedWidth(140)
         self.ram_cap_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.ram_cap_spin.setEnabled(self.ram_cap_check.isChecked())
         self.ram_cap_spin.setToolTip("Killed by the kernel if exceeded")
