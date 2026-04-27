@@ -3,32 +3,32 @@
 
 Features:
 - Drag & drop or file picker for audio/video
-- Model selector (tiny, base, small, medium, large-v3, turbo)
-- CPU thread cap and RAM cap (RLIMIT_AS)
+- Model picker rendered as cards with download status, size, RAM estimate
+- CPU thread cap (range derived from the running system)
+- Live system RAM display; warns if the picked model exceeds available memory
 - Progress while transcribing (runs in a worker thread)
-- Save result to .txt / .srt / .vtt or copy to clipboard
+- Save result to .txt / .srt / .vtt / .json or copy to clipboard
 - Settings dialog: download/delete cached models
+- Theme palette read from Omarchy (~/.config/omarchy/current/theme/colors.toml)
 """
 from __future__ import annotations
 
 import json
-import multiprocessing
 import os
-import resource
 import sys
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl
-from PyQt6.QtGui import QAction, QGuiApplication, QIcon, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QGuiApplication, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
+    QButtonGroup,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -37,6 +37,9 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStatusBar,
     QTableWidget,
@@ -51,19 +54,20 @@ APP_ID = "whisper-transcription-arch"
 CONFIG_DIR = Path.home() / ".config" / APP_ID
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 WHISPER_CACHE = Path.home() / ".cache" / "whisper"
+THEME_COLORS_PATH = Path.home() / ".config/omarchy/current/theme/colors.toml"
 
-# (model_id, approx download MB, approx peak RAM)
-MODELS: list[tuple[str, int, str]] = [
-    ("tiny", 75, "~1 GB RAM"),
-    ("tiny.en", 75, "~1 GB RAM"),
-    ("base", 142, "~1 GB RAM"),
-    ("base.en", 142, "~1 GB RAM"),
-    ("small", 466, "~2 GB RAM"),
-    ("small.en", 466, "~2 GB RAM"),
-    ("medium", 1500, "~5 GB RAM"),
-    ("medium.en", 1500, "~5 GB RAM"),
-    ("large-v3", 2900, "~10 GB RAM"),
-    ("turbo", 1500, "~6 GB RAM"),
+# (model_id, approx download MB, approx peak RAM in GB)
+MODELS: list[tuple[str, int, float]] = [
+    ("tiny", 75, 1.0),
+    ("tiny.en", 75, 1.0),
+    ("base", 142, 1.0),
+    ("base.en", 142, 1.0),
+    ("small", 466, 2.0),
+    ("small.en", 466, 2.0),
+    ("medium", 1500, 5.0),
+    ("medium.en", 1500, 5.0),
+    ("large-v3", 2900, 10.0),
+    ("turbo", 1500, 6.0),
 ]
 
 AUDIO_EXTS = {
@@ -72,6 +76,7 @@ AUDIO_EXTS = {
     ".avi", ".mpeg", ".mpg", ".3gp", ".ts",
 }
 
+# --- Settings -----------------------------------------------------------
 
 def load_settings() -> dict:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,6 +92,8 @@ def save_settings(data: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(data, indent=2))
 
+
+# --- Model cache helpers ------------------------------------------------
 
 def model_cache_path(name: str) -> Path:
     return WHISPER_CACHE / f"{name}.pt"
@@ -105,9 +112,169 @@ def human_size(num: int) -> str:
     f = float(num)
     for unit in ("B", "KB", "MB", "GB"):
         if f < 1024 or unit == "GB":
-            return f"{f:.1f} {unit}" if unit != "B" else f"{int(f)} {unit}"
+            return f"{int(f)} {unit}" if unit == "B" else f"{f:.1f} {unit}"
         f /= 1024
     return f"{f:.1f} GB"
+
+
+# --- System info --------------------------------------------------------
+
+def cpu_count() -> int:
+    return os.cpu_count() or 1
+
+
+def _meminfo() -> dict[str, int]:
+    """Parse /proc/meminfo into a dict of kB values."""
+    info: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, _, rest = line.partition(":")
+            parts = rest.strip().split()
+            if parts and parts[0].isdigit():
+                info[key] = int(parts[0])  # kB
+    except Exception:
+        pass
+    return info
+
+
+def total_ram_gb() -> float:
+    return _meminfo().get("MemTotal", 0) / 1024 / 1024
+
+
+def available_ram_gb() -> float:
+    info = _meminfo()
+    if "MemAvailable" in info:
+        return info["MemAvailable"] / 1024 / 1024
+    return (info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)) / 1024 / 1024
+
+
+# --- Theme --------------------------------------------------------------
+
+DEFAULT_THEME = {
+    "background": "#1a1b26",
+    "foreground": "#a9b1d6",
+    "accent": "#7aa2f7",
+    "selection_foreground": "#1a1b26",
+    "color0": "#32344a",
+    "color1": "#f7768e",
+    "color2": "#9ece6a",
+    "color3": "#e0af68",
+    "color4": "#7aa2f7",
+    "color8": "#444b6a",
+}
+
+
+def load_theme() -> dict:
+    """Read Omarchy theme colors; fall back to Tokyo Night defaults."""
+    theme = dict(DEFAULT_THEME)
+    if not THEME_COLORS_PATH.exists():
+        return theme
+    try:
+        import tomllib
+        with open(THEME_COLORS_PATH, "rb") as f:
+            data = tomllib.load(f)
+        for k, v in data.items():
+            if isinstance(v, str) and v.startswith("#"):
+                theme[k] = v
+    except Exception:
+        pass
+    return theme
+
+
+def build_stylesheet(t: dict) -> str:
+    bg = t["background"]
+    fg = t["foreground"]
+    accent = t.get("accent") or t.get("color4", "#7aa2f7")
+    sel_fg = t.get("selection_foreground", bg)
+    border = t.get("color8", "#444b6a")
+    surface = t.get("color0", "#32344a")
+    danger = t.get("color1", "#f7768e")
+    return f"""
+    QMainWindow, QDialog, QWidget {{
+        background: {bg};
+        color: {fg};
+        font-size: 10pt;
+    }}
+    QLabel {{ background: transparent; color: {fg}; }}
+    QLabel[role="muted"] {{ color: {border}; }}
+    QLabel[role="warning"] {{ color: {danger}; }}
+    QGroupBox {{
+        border: 1px solid {border};
+        border-radius: 8px;
+        margin-top: 14px;
+        padding: 10px;
+        font-weight: 600;
+    }}
+    QGroupBox::title {{
+        subcontrol-origin: margin;
+        left: 12px;
+        padding: 0 6px;
+        color: {accent};
+    }}
+    QPushButton {{
+        background: {surface};
+        color: {fg};
+        border: 1px solid {border};
+        border-radius: 6px;
+        padding: 6px 14px;
+    }}
+    QPushButton:hover {{ background: {accent}; color: {sel_fg}; border-color: {accent}; }}
+    QPushButton:pressed {{ background: {accent}; color: {sel_fg}; }}
+    QPushButton:disabled {{ color: {border}; border-color: {border}; background: {bg}; }}
+    QPushButton[role="primary"] {{
+        background: {accent}; color: {sel_fg}; border-color: {accent}; font-weight: 600;
+    }}
+    QPushButton[role="primary"]:hover {{ background: {fg}; color: {bg}; border-color: {fg}; }}
+    QPushButton[role="primary"]:disabled {{ background: {surface}; color: {border}; border-color: {border}; }}
+    QLineEdit, QTextEdit, QSpinBox {{
+        background: {bg};
+        color: {fg};
+        border: 1px solid {border};
+        border-radius: 6px;
+        padding: 4px 6px;
+        selection-background-color: {accent};
+        selection-color: {sel_fg};
+    }}
+    QLineEdit:focus, QTextEdit:focus, QSpinBox:focus {{ border-color: {accent}; }}
+    QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; }}
+    QProgressBar {{
+        background: {surface}; color: {fg};
+        border: 1px solid {border}; border-radius: 6px;
+        text-align: center; min-height: 18px;
+    }}
+    QProgressBar::chunk {{ background: {accent}; border-radius: 4px; }}
+    QStatusBar {{ background: {surface}; color: {fg}; }}
+    QMenuBar {{ background: {bg}; color: {fg}; }}
+    QMenuBar::item:selected {{ background: {accent}; color: {sel_fg}; }}
+    QMenu {{ background: {surface}; color: {fg}; border: 1px solid {border}; }}
+    QMenu::item:selected {{ background: {accent}; color: {sel_fg}; }}
+    QHeaderView::section {{ background: {surface}; color: {fg}; border: 0; padding: 6px; }}
+    QTableWidget {{ background: {bg}; color: {fg}; gridline-color: {border}; border: 1px solid {border}; border-radius: 6px; }}
+    QScrollArea {{ border: 0; background: transparent; }}
+    QRadioButton {{ background: transparent; color: {fg}; }}
+
+    ModelCard {{
+        background: {surface};
+        border: 1px solid {border};
+        border-radius: 8px;
+    }}
+    ModelCard[selected="true"] {{
+        border: 2px solid {accent};
+        background: {bg};
+    }}
+    ModelCard[downloaded="true"] QLabel#status {{ color: {t.get("color2", "#9ece6a")}; }}
+    ModelCard[downloaded="false"] QLabel#status {{ color: {border}; }}
+    DropLabel {{
+        border: 2px dashed {border};
+        border-radius: 8px;
+        color: {border};
+        padding: 18px;
+    }}
+    DropLabel[hasFile="true"] {{
+        border-color: {accent};
+        color: {fg};
+    }}
+    """
 
 
 # --- Worker threads -----------------------------------------------------
@@ -117,38 +284,24 @@ class TranscribeWorker(QThread):
     finished_ok = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(
-        self,
-        file_path: str,
-        model_name: str,
-        cpu_threads: int,
-        ram_limit_gb: int,
-        language: str | None,
-    ):
+    def __init__(self, file_path: str, model_name: str, cpu_threads: int, language: str | None):
         super().__init__()
         self.file_path = file_path
         self.model_name = model_name
         self.cpu_threads = cpu_threads
-        self.ram_limit_gb = ram_limit_gb
         self.language = language
 
     def run(self) -> None:
         try:
-            if self.ram_limit_gb > 0:
-                bytes_limit = self.ram_limit_gb * 1024**3
-                try:
-                    resource.setrlimit(resource.RLIMIT_AS, (bytes_limit, bytes_limit))
-                except (ValueError, OSError) as e:
-                    self.progress.emit(f"RAM limit not applied: {e}")
-
             self.progress.emit(f"Loading model {self.model_name}…")
             import torch
             torch.set_num_threads(max(1, self.cpu_threads))
+            os.environ.setdefault("OMP_NUM_THREADS", str(self.cpu_threads))
+            os.environ.setdefault("MKL_NUM_THREADS", str(self.cpu_threads))
             import whisper
 
             model = whisper.load_model(self.model_name, device="cpu")
             self.progress.emit("Transcribing… (this may take a while)")
-
             result = model.transcribe(
                 self.file_path,
                 language=self.language or None,
@@ -180,13 +333,152 @@ class DownloadWorker(QThread):
             self.failed.emit(str(e))
 
 
+# --- Custom widgets -----------------------------------------------------
+
+class DropLabel(QLabel):
+    fileDropped = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("DropLabel")
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(90)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setProperty("hasFile", "false")
+        self.setText("Drop an audio/video file here  ·  or click Open File…")
+
+    def setHasFile(self, has: bool) -> None:
+        self.setProperty("hasFile", "true" if has else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dragEnterEvent(self, e: QDragEnterEvent) -> None:
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e: QDropEvent) -> None:
+        for url in e.mimeData().urls():
+            if url.isLocalFile():
+                self.fileDropped.emit(url.toLocalFile())
+                return
+
+
+class ModelCard(QFrame):
+    """One model row: radio button + name, status badge, RAM estimate, disk size."""
+    clicked = pyqtSignal(str)
+
+    def __init__(self, name: str, dl_mb: int, ram_gb: float):
+        super().__init__()
+        self.name = name
+        self.dl_mb = dl_mb
+        self.ram_gb = ram_gb
+        self.setProperty("selected", "false")
+        self.setProperty("downloaded", "false")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
+
+        self.radio = QRadioButton()
+        self.radio.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout.addWidget(self.radio)
+
+        name_lbl = QLabel(name)
+        f = name_lbl.font()
+        f.setBold(True)
+        name_lbl.setFont(f)
+        name_lbl.setMinimumWidth(90)
+        layout.addWidget(name_lbl)
+
+        self.status_lbl = QLabel()
+        self.status_lbl.setObjectName("status")
+        self.status_lbl.setMinimumWidth(120)
+        layout.addWidget(self.status_lbl)
+
+        self.size_lbl = QLabel()
+        self.size_lbl.setProperty("role", "muted")
+        layout.addWidget(self.size_lbl)
+
+        layout.addStretch(1)
+
+        ram_lbl = QLabel(f"~{ram_gb:.0f} GB RAM")
+        ram_lbl.setProperty("role", "muted")
+        layout.addWidget(ram_lbl)
+
+        self.refresh_status()
+
+    def mousePressEvent(self, _e):
+        self.clicked.emit(self.name)
+
+    def refresh_status(self) -> None:
+        downloaded = is_model_downloaded(self.name)
+        self.setProperty("downloaded", "true" if downloaded else "false")
+        if downloaded:
+            self.status_lbl.setText("✓ downloaded")
+            self.size_lbl.setText(human_size(model_disk_size(self.name)))
+        else:
+            self.status_lbl.setText("not downloaded")
+            self.size_lbl.setText(f"~{self.dl_mb} MB to download")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def setSelected(self, selected: bool) -> None:
+        self.setProperty("selected", "true" if selected else "false")
+        self.radio.setChecked(selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class ModelPicker(QWidget):
+    selectionChanged = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.cards: dict[str, ModelCard] = {}
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        for name, dl_mb, ram_gb in MODELS:
+            card = ModelCard(name, dl_mb, ram_gb)
+            card.clicked.connect(self._on_card_clicked)
+            self._group.addButton(card.radio)
+            layout.addWidget(card)
+            self.cards[name] = card
+
+    def _on_card_clicked(self, name: str) -> None:
+        self.select(name)
+
+    def select(self, name: str) -> None:
+        if name not in self.cards:
+            return
+        for n, card in self.cards.items():
+            card.setSelected(n == name)
+        self.selectionChanged.emit(name)
+
+    def selected(self) -> str | None:
+        for n, card in self.cards.items():
+            if card.property("selected") == "true":
+                return n
+        return None
+
+    def refresh(self) -> None:
+        for card in self.cards.values():
+            card.refresh_status()
+
+
 # --- Settings dialog ----------------------------------------------------
 
 class SettingsDialog(QDialog):
+    modelsChanged = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings — Models")
-        self.resize(560, 420)
+        self.resize(600, 440)
         self._download_worker: DownloadWorker | None = None
 
         layout = QVBoxLayout(self)
@@ -213,15 +505,11 @@ class SettingsDialog(QDialog):
         self.refresh()
 
     def refresh(self) -> None:
-        for row, (name, dl_mb, ram) in enumerate(MODELS):
+        for row, (name, dl_mb, ram_gb) in enumerate(MODELS):
             downloaded = is_model_downloaded(name)
             self.table.setItem(row, 0, QTableWidgetItem(name))
-            status_text = "✓ downloaded" if downloaded else "not downloaded"
-            self.table.setItem(row, 1, QTableWidgetItem(status_text))
-            if downloaded:
-                size_text = human_size(model_disk_size(name))
-            else:
-                size_text = f"~{dl_mb} MB · {ram}"
+            self.table.setItem(row, 1, QTableWidgetItem("✓ downloaded" if downloaded else "not downloaded"))
+            size_text = human_size(model_disk_size(name)) if downloaded else f"~{dl_mb} MB · ~{ram_gb:.0f} GB RAM"
             self.table.setItem(row, 2, QTableWidgetItem(size_text))
 
             btn = QPushButton("Delete" if downloaded else "Download")
@@ -246,6 +534,7 @@ class SettingsDialog(QDialog):
         try:
             path.unlink()
             self.status.setText(f"Deleted {name}.")
+            self.modelsChanged.emit()
         except Exception as e:
             QMessageBox.critical(self, "Delete failed", str(e))
         self.refresh()
@@ -263,38 +552,12 @@ class SettingsDialog(QDialog):
 
     def _on_download_done(self, name: str) -> None:
         self.status.setText(f"Downloaded {name}.")
+        self.modelsChanged.emit()
         self.refresh()
 
     def _on_download_failed(self, msg: str) -> None:
         self.status.setText("Download failed.")
         QMessageBox.critical(self, "Download failed", msg)
-
-
-# --- Drop area ----------------------------------------------------------
-
-class DropLabel(QLabel):
-    fileDropped = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self.setAcceptDrops(True)
-        self.setMinimumHeight(120)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setText("Drop an audio/video file here\nor click Open File…")
-        self.setStyleSheet(
-            "QLabel { border: 2px dashed #888; border-radius: 8px;"
-            " padding: 24px; color: #888; }"
-        )
-
-    def dragEnterEvent(self, e: QDragEnterEvent) -> None:
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
-
-    def dropEvent(self, e: QDropEvent) -> None:
-        for url in e.mimeData().urls():
-            if url.isLocalFile():
-                self.fileDropped.emit(url.toLocalFile())
-                return
 
 
 # --- Main window --------------------------------------------------------
@@ -303,7 +566,7 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_file: str | None = None):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(820, 640)
+        self.resize(880, 760)
         self.settings = load_settings()
         self.current_file: str | None = None
         self.last_result: dict | None = None
@@ -312,13 +575,23 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        root.setSpacing(10)
 
-        # File row
-        file_row = QHBoxLayout()
+        # System info bar (live)
+        self.sys_info = QLabel()
+        self.sys_info.setProperty("role", "muted")
+        root.addWidget(self.sys_info)
+        self._sys_timer = QTimer(self)
+        self._sys_timer.timeout.connect(self._refresh_sys_info)
+        self._sys_timer.start(2000)
+        self._refresh_sys_info()
+
+        # File group
+        file_box = QGroupBox("File")
+        fbl = QVBoxLayout(file_box)
         self.drop = DropLabel()
         self.drop.fileDropped.connect(self.set_file)
-        file_row.addWidget(self.drop, 1)
-        root.addLayout(file_row)
+        fbl.addWidget(self.drop)
 
         path_row = QHBoxLayout()
         self.file_edit = QLineEdit()
@@ -328,45 +601,45 @@ class MainWindow(QMainWindow):
         open_btn.clicked.connect(self.pick_file)
         path_row.addWidget(self.file_edit, 1)
         path_row.addWidget(open_btn)
-        root.addLayout(path_row)
+        fbl.addLayout(path_row)
+        root.addWidget(file_box)
 
-        # Options
-        opts = QGroupBox("Options")
-        opts_layout = QFormLayout(opts)
+        # Model picker (always-expanded card list)
+        model_box = QGroupBox("Model")
+        mbl = QVBoxLayout(model_box)
+        self.picker = ModelPicker()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.picker)
+        scroll.setMinimumHeight(220)
+        mbl.addWidget(scroll)
+        self.model_warning = QLabel("")
+        self.model_warning.setProperty("role", "warning")
+        mbl.addWidget(self.model_warning)
+        self.picker.selectionChanged.connect(self._on_model_changed)
+        root.addWidget(model_box)
 
-        self.model_combo = QComboBox()
-        for name, dl_mb, ram in MODELS:
-            label = f"{name}   ({ram}, ~{dl_mb} MB)"
-            self.model_combo.addItem(label, userData=name)
-        last_model = self.settings.get("model", "base")
-        idx = self.model_combo.findData(last_model)
-        if idx >= 0:
-            self.model_combo.setCurrentIndex(idx)
-        opts_layout.addRow("Model:", self.model_combo)
-
-        cpus = max(1, multiprocessing.cpu_count())
+        # Resources / language
+        res_box = QGroupBox("Resources")
+        form = QFormLayout(res_box)
+        cpus = cpu_count()
         self.cpu_spin = QSpinBox()
         self.cpu_spin.setRange(1, cpus)
-        self.cpu_spin.setValue(self.settings.get("cpu_threads", max(1, cpus // 2)))
-        opts_layout.addRow(f"CPU threads (1–{cpus}):", self.cpu_spin)
-
-        self.ram_spin = QSpinBox()
-        self.ram_spin.setRange(0, 256)
-        self.ram_spin.setSuffix(" GB")
-        self.ram_spin.setSpecialValueText("Unlimited")
-        self.ram_spin.setValue(self.settings.get("ram_gb", 0))
-        opts_layout.addRow("RAM cap (0 = off):", self.ram_spin)
+        default_cpu = self.settings.get("cpu_threads", max(1, cpus // 2))
+        self.cpu_spin.setValue(min(default_cpu, cpus))
+        form.addRow(QLabel(f"CPU threads (1 – {cpus} available):"), self.cpu_spin)
 
         self.lang_edit = QLineEdit()
         self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
         self.lang_edit.setText(self.settings.get("language", ""))
-        opts_layout.addRow("Language:", self.lang_edit)
+        form.addRow(QLabel("Language:"), self.lang_edit)
 
-        root.addWidget(opts)
+        root.addWidget(res_box)
 
-        # Buttons
+        # Action buttons
         btns = QHBoxLayout()
         self.start_btn = QPushButton("Start transcription")
+        self.start_btn.setProperty("role", "primary")
         self.start_btn.clicked.connect(self.start_transcription)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
@@ -382,11 +655,11 @@ class MainWindow(QMainWindow):
         root.addWidget(self.progress)
 
         # Result
-        root.addWidget(QLabel("Result:"))
+        result_box = QGroupBox("Result")
+        rbl = QVBoxLayout(result_box)
         self.result_edit = QTextEdit()
         self.result_edit.setPlaceholderText("Transcription will appear here.")
-        root.addWidget(self.result_edit, 1)
-
+        rbl.addWidget(self.result_edit)
         out_btns = QHBoxLayout()
         self.copy_btn = QPushButton("Copy to clipboard")
         self.copy_btn.clicked.connect(self.copy_result)
@@ -397,7 +670,8 @@ class MainWindow(QMainWindow):
         out_btns.addWidget(self.copy_btn)
         out_btns.addWidget(self.save_btn)
         out_btns.addStretch(1)
-        root.addLayout(out_btns)
+        rbl.addLayout(out_btns)
+        root.addWidget(result_box, 1)
 
         # Menu
         settings_act = QAction("&Settings…", self)
@@ -417,8 +691,47 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready")
 
+        # Initial selection: prefer settings, then a downloaded model, then "base"
+        last = self.settings.get("model")
+        candidates = (
+            [last] if last else []
+        ) + [n for n, *_ in MODELS if is_model_downloaded(n)] + ["base"]
+        for c in candidates:
+            if c and c in self.picker.cards:
+                self.picker.select(c)
+                break
+
         if initial_file:
             self.set_file(initial_file)
+
+    # --- system info ----------------------------------------------------
+    def _refresh_sys_info(self) -> None:
+        total = total_ram_gb()
+        avail = available_ram_gb()
+        self.sys_info.setText(
+            f"System · RAM {avail:.1f} GB available of {total:.1f} GB · {cpu_count()} CPU cores"
+        )
+        # also re-check selected-model warning (available RAM moves)
+        sel = self.picker.selected() if hasattr(self, "picker") else None
+        if sel:
+            self._update_model_warning(sel)
+
+    def _on_model_changed(self, name: str) -> None:
+        self._update_model_warning(name)
+
+    def _update_model_warning(self, name: str) -> None:
+        ram = next((r for n, _, r in MODELS if n == name), 0.0)
+        avail = available_ram_gb()
+        if ram > avail:
+            self.model_warning.setText(
+                f"⚠ {name} typically needs ~{ram:.0f} GB RAM but only {avail:.1f} GB is available."
+            )
+        elif ram > avail - 1:
+            self.model_warning.setText(
+                f"ℹ {name} needs ~{ram:.0f} GB RAM; close other apps for headroom."
+            )
+        else:
+            self.model_warning.setText("")
 
     # --- file selection -------------------------------------------------
     def pick_file(self) -> None:
@@ -444,21 +757,38 @@ class MainWindow(QMainWindow):
         self.current_file = str(p)
         self.file_edit.setText(self.current_file)
         self.drop.setText(p.name)
+        self.drop.setHasFile(True)
 
     # --- transcription --------------------------------------------------
     def start_transcription(self) -> None:
         if not self.current_file:
             QMessageBox.information(self, "No file", "Pick a file first.")
             return
-        model_name = self.model_combo.currentData()
+        model_name = self.picker.selected()
+        if not model_name:
+            QMessageBox.information(self, "No model", "Pick a model first.")
+            return
         cpu_threads = self.cpu_spin.value()
-        ram_gb = self.ram_spin.value()
         language = self.lang_edit.text().strip() or None
+
+        # Pre-flight RAM check (advisory, not enforced)
+        ram_need = next((r for n, _, r in MODELS if n == model_name), 0.0)
+        avail = available_ram_gb()
+        if ram_need > avail:
+            ok = QMessageBox.warning(
+                self, "Likely out of memory",
+                f"Model {model_name} typically needs ~{ram_need:.0f} GB RAM, "
+                f"but only {avail:.1f} GB is available. Whisper will probably "
+                f"fail with an allocation error. Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ok != QMessageBox.StandardButton.Yes:
+                return
 
         self.settings.update({
             "model": model_name,
             "cpu_threads": cpu_threads,
-            "ram_gb": ram_gb,
             "language": language or "",
         })
         save_settings(self.settings)
@@ -469,9 +799,7 @@ class MainWindow(QMainWindow):
         self.copy_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
 
-        self.worker = TranscribeWorker(
-            self.current_file, model_name, cpu_threads, ram_gb, language,
-        )
+        self.worker = TranscribeWorker(self.current_file, model_name, cpu_threads, language)
         self.worker.progress.connect(self.statusBar().showMessage)
         self.worker.finished_ok.connect(self.on_transcribe_done)
         self.worker.failed.connect(self.on_transcribe_failed)
@@ -497,6 +825,7 @@ class MainWindow(QMainWindow):
         self.save_btn.setEnabled(True)
         self.statusBar().showMessage("Done")
         self.set_running(False)
+        self.picker.refresh()  # in case the model just got downloaded mid-run
 
     def on_transcribe_failed(self, msg: str) -> None:
         self.set_running(False)
@@ -505,15 +834,14 @@ class MainWindow(QMainWindow):
 
     # --- output ---------------------------------------------------------
     def copy_result(self) -> None:
-        text = self.result_edit.toPlainText()
-        QGuiApplication.clipboard().setText(text)
+        QGuiApplication.clipboard().setText(self.result_edit.toPlainText())
         self.statusBar().showMessage("Copied to clipboard")
 
     def save_result(self) -> None:
         if not self.last_result:
             return
         default = Path(self.current_file or "transcript").with_suffix(".txt").name
-        path, selected = QFileDialog.getSaveFileName(
+        path, _ = QFileDialog.getSaveFileName(
             self, "Save transcription", default,
             "Plain text (*.txt);;SubRip (*.srt);;WebVTT (*.vtt);;JSON (*.json)",
         )
@@ -541,7 +869,7 @@ class MainWindow(QMainWindow):
         return f"{h:02d}:{m:02d}:{int(s):02d}{sep}{int((s - int(s)) * 1000):03d}"
 
     def _to_srt(self, result: dict) -> str:
-        lines = []
+        lines: list[str] = []
         for i, seg in enumerate(result.get("segments", []), 1):
             lines.append(str(i))
             lines.append(f"{self._ts(seg['start'])} --> {self._ts(seg['end'])}")
@@ -560,13 +888,16 @@ class MainWindow(QMainWindow):
     # --- misc -----------------------------------------------------------
     def open_settings(self) -> None:
         dlg = SettingsDialog(self)
+        dlg.modelsChanged.connect(self.picker.refresh)
         dlg.exec()
+        self.picker.refresh()
 
     def show_about(self) -> None:
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"{APP_NAME}\n\nSimple GUI for OpenAI Whisper.\n"
-            f"Models cache: {WHISPER_CACHE}\nConfig: {CONFIG_FILE}",
+            f"Models cache: {WHISPER_CACHE}\nConfig: {CONFIG_FILE}\n"
+            f"Theme: {THEME_COLORS_PATH if THEME_COLORS_PATH.exists() else 'built-in default'}",
         )
 
 
@@ -575,6 +906,9 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setDesktopFileName(APP_ID)
+
+    theme = load_theme()
+    app.setStyleSheet(build_stylesheet(theme))
 
     initial = sys.argv[1] if len(sys.argv) > 1 else None
     win = MainWindow(initial_file=initial)
