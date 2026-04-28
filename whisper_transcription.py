@@ -1416,7 +1416,7 @@ class RecordPanel(QWidget):
         # Big record button
         self.record_btn = QPushButton()
         self.record_btn.setObjectName("RecordButton")
-        self.record_btn.setMinimumHeight(64)
+        self.record_btn.setMinimumHeight(48)
         self.record_btn.setProperty("recording", "false")
         self.record_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.record_btn.clicked.connect(self._on_clicked)
@@ -1636,7 +1636,7 @@ class LivePanel(QWidget):
         # Big Start / Stop button (toggle).
         self.toggle_btn = QPushButton()
         self.toggle_btn.setObjectName("RecordButton")
-        self.toggle_btn.setMinimumHeight(64)
+        self.toggle_btn.setMinimumHeight(48)
         self.toggle_btn.setProperty("recording", "false")
         self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.toggle_btn.clicked.connect(self._on_toggle)
@@ -1654,7 +1654,7 @@ class LivePanel(QWidget):
         self.text.setPlaceholderText(
             "Live transcription will stream in here as you talk."
         )
-        self.text.setMinimumHeight(180)
+        self.text.setMinimumHeight(80)
         layout.addWidget(self.text, 1)
 
         out_row = QHBoxLayout()
