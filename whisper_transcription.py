@@ -2176,6 +2176,11 @@ class MainWindow(QMainWindow):
         live_layout.addWidget(self.live_panel)
         self.source_tabs.addTab(live_tab, "Live")
 
+        # Hide the file-transcription chrome (Start/Cancel + Result
+        # tabs) when Live is active — Live has its own start button
+        # and its own text area, so those rows are dead weight there.
+        self.source_tabs.currentChanged.connect(self._on_source_tab_changed)
+
         root.addWidget(self.source_tabs)
 
         # Model + resource configuration lives in App → Settings.
@@ -2198,8 +2203,13 @@ class MainWindow(QMainWindow):
         self.model_warning.setContentsMargins(4, 0, 4, 0)
         root.addWidget(self.model_warning)
 
-        # Action buttons
-        btns = QHBoxLayout()
+        # Action buttons. Wrapped in their own QWidget so the whole
+        # row can be hidden together when the Live tab is active —
+        # that tab has its own start/stop and doesn't run the file
+        # transcription pipeline.
+        self.action_row = QWidget()
+        btns = QHBoxLayout(self.action_row)
+        btns.setContentsMargins(0, 0, 0, 0)
         self.start_btn = QPushButton("Start transcription")
         self.start_btn.setProperty("role", "primary")
         self.start_btn.clicked.connect(self.start_transcription)
@@ -2209,7 +2219,7 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.start_btn)
         btns.addWidget(self.cancel_btn)
         btns.addStretch(1)
-        root.addLayout(btns)
+        root.addWidget(self.action_row)
 
         # Progress: phase text lives on a label above the bar so it is
         # always readable; the bar itself only shows the percentage so
@@ -2259,6 +2269,7 @@ class MainWindow(QMainWindow):
         out_btns.addWidget(self.save_btn)
         out_btns.addStretch(1)
         rbl.addLayout(out_btns)
+        self.result_box = result_box  # tracked so we can hide it on Live
         root.addWidget(result_box, 1)
 
         # Menu
@@ -2292,6 +2303,22 @@ class MainWindow(QMainWindow):
 
         if initial_file:
             self.set_file(initial_file)
+        self._on_source_tab_changed(self.source_tabs.currentIndex())
+
+    def _on_source_tab_changed(self, index: int) -> None:
+        # Hide the file-pipeline chrome on Live — that tab has its own
+        # Start/Stop and its own text area, doesn't go through the
+        # transcribe-file flow.
+        is_live = self.source_tabs.tabText(index) == "Live"
+        self.action_row.setVisible(not is_live)
+        self.result_box.setVisible(not is_live)
+        if is_live:
+            self.progress_phase_lbl.setVisible(False)
+            self.progress.setVisible(False)
+        else:
+            running = self.worker.is_running()
+            self.progress_phase_lbl.setVisible(running)
+            self.progress.setVisible(running)
 
     # --- system info ----------------------------------------------------
     def _refresh_sys_info(self) -> None:
