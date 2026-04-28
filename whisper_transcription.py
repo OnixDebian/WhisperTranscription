@@ -48,6 +48,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -2135,10 +2136,23 @@ class MainWindow(QMainWindow):
         self._sys_timer.start(2000)
         self._refresh_sys_info()
 
-        # Source tabs: File (drop / open) vs Record (live capture)
-        self.source_tabs = QTabWidget()
-        self.source_tabs.tabBar().setDrawBase(False)
-        self.source_tabs.setDocumentMode(True)
+        # Source tabs: a manual QTabBar + QStackedWidget instead of
+        # QTabWidget, because QTabWidget sizes its pane to the tallest
+        # tab (Live) and that left File/Record with a big empty band
+        # below the content. With a stacked widget the visible area
+        # collapses to the current page's natural size.
+        self.source_tab_bar = QTabBar()
+        self.source_tab_bar.setDrawBase(False)
+        self.source_tab_bar.addTab("File")
+        self.source_tab_bar.addTab("Record")
+        self.source_tab_bar.addTab("Live")
+
+        self.source_pages = QStackedWidget()
+        # Honour the current page's vertical hint and don't reserve
+        # extra height for the unused pages.
+        self.source_pages.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
 
         file_tab = QWidget()
         fbl = QVBoxLayout(file_tab)
@@ -2156,11 +2170,7 @@ class MainWindow(QMainWindow):
         path_row.addWidget(self.file_edit, 1)
         path_row.addWidget(open_btn)
         fbl.addLayout(path_row)
-        # Push content to the top — QTabWidget sizes the pane to the
-        # tallest tab (Live), so without a trailing stretch File and
-        # Record have a big empty band centred between their widgets.
-        fbl.addStretch(1)
-        self.source_tabs.addTab(file_tab, "File")
+        self.source_pages.addWidget(file_tab)
 
         record_tab = QWidget()
         rec_layout = QVBoxLayout(record_tab)
@@ -2169,8 +2179,7 @@ class MainWindow(QMainWindow):
         self.record_panel.fileRecorded.connect(self._on_recording_finished)
         self.record_panel.statusMessage.connect(self.statusBar().showMessage)
         rec_layout.addWidget(self.record_panel)
-        rec_layout.addStretch(1)
-        self.source_tabs.addTab(record_tab, "Record")
+        self.source_pages.addWidget(record_tab)
 
         live_tab = QWidget()
         live_layout = QVBoxLayout(live_tab)
@@ -2182,14 +2191,14 @@ class MainWindow(QMainWindow):
         # Worker streams transcribed text back via live_chunk → panel.
         self.worker.live_chunk.connect(self.live_panel.append_text)
         live_layout.addWidget(self.live_panel)
-        self.source_tabs.addTab(live_tab, "Live")
+        self.source_pages.addWidget(live_tab)
 
-        # Hide the file-transcription chrome (Start/Cancel + Result
-        # tabs) when Live is active — Live has its own start button
-        # and its own text area, so those rows are dead weight there.
-        self.source_tabs.currentChanged.connect(self._on_source_tab_changed)
+        # Wire the tab bar to the stack and to the chrome-toggle.
+        self.source_tab_bar.currentChanged.connect(self.source_pages.setCurrentIndex)
+        self.source_tab_bar.currentChanged.connect(self._on_source_tab_changed)
 
-        root.addWidget(self.source_tabs)
+        root.addWidget(self.source_tab_bar)
+        root.addWidget(self.source_pages)
 
         # Model + resource configuration lives in App → Settings.
         # The main window only shows a compact read-only summary line
@@ -2311,13 +2320,13 @@ class MainWindow(QMainWindow):
 
         if initial_file:
             self.set_file(initial_file)
-        self._on_source_tab_changed(self.source_tabs.currentIndex())
+        self._on_source_tab_changed(self.source_tab_bar.currentIndex())
 
     def _on_source_tab_changed(self, index: int) -> None:
         # Hide the file-pipeline chrome on Live — that tab has its own
         # Start/Stop and its own text area, doesn't go through the
         # transcribe-file flow.
-        is_live = self.source_tabs.tabText(index) == "Live"
+        is_live = self.source_tab_bar.tabText(index) == "Live"
         self.action_row.setVisible(not is_live)
         self.result_box.setVisible(not is_live)
         if is_live:
