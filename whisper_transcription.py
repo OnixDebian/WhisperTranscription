@@ -1525,103 +1525,204 @@ class RecordPanel(QWidget):
         self.duration_lbl.setText(f"⏺  {m:02d}:{s:02d}")
 
 
-class ModelPickerDialog(QDialog):
-    """Modal popup that lets the user pick a model.
+# --- Settings dialog ----------------------------------------------------
 
-    Why a popup instead of an inline collapsible section: when the
-    inline section opens it expands the main window, but on close the
-    main window does not shrink back — Qt distributes the freed space
-    to the Result text area instead. Wrapping the picker in a modal
-    leaves the main window untouched.
+class SettingsDialog(QDialog):
+    """Combined Settings: pick a model, manage downloads, set CPU/RAM/lang.
+
+    Two tabs:
+      Models     — card-list picker + Download/Delete for the selected model.
+      Resources  — CPU thread count, optional hard RAM cap, language hint.
+
+    Returns the new values on accept; the caller (MainWindow) reads them
+    back via the public accessors and persists/applies them.
     """
 
-    def __init__(self, current_model: str | None, parent=None):
+    modelsChanged = pyqtSignal()
+
+    def __init__(
+        self,
+        settings: dict,
+        current_model: str | None,
+        cpu_max: int,
+        ram_max: int,
+        parent=None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Choose model")
+        self.setWindowTitle("Settings")
         self.setModal(True)
-        self.resize(640, 540)
+        self.resize(720, 600)
+        self._download_worker: DownloadWorker | None = None
+        self._cpu_max = cpu_max
+        self._ram_max = ram_max
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
-        layout.addWidget(QLabel(
-            "Pick a Whisper model. Larger models are more accurate "
-            "but need more RAM and time."
-        ))
 
+        tabs = QTabWidget()
+        tabs.tabBar().setDrawBase(False)
+        tabs.setDocumentMode(True)
+
+        # --- Models tab ------------------------------------------------
+        models_tab = QWidget()
+        ml = QVBoxLayout(models_tab)
+        ml.setContentsMargins(8, 12, 8, 6)
+        ml.setSpacing(8)
+        ml.addWidget(QLabel(
+            "Pick a model. Larger models are more accurate but need "
+            "more RAM and time."
+        ))
         self.picker = ModelPicker()
         if current_model:
             self.picker.select(current_model)
-
+        self.picker.selectionChanged.connect(self._refresh_action)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.picker)
-        layout.addWidget(scroll, 1)
+        ml.addWidget(scroll, 1)
+
+        action_row = QHBoxLayout()
+        self.action_btn = QPushButton("…")
+        self.action_btn.clicked.connect(self._toggle_action)
+        action_row.addWidget(self.action_btn)
+        action_row.addStretch(1)
+        self.dl_status = QLabel("")
+        self.dl_status.setProperty("role", "muted")
+        action_row.addWidget(self.dl_status)
+        ml.addLayout(action_row)
+        tabs.addTab(models_tab, "Models")
+
+        # --- Resources tab --------------------------------------------
+        res_tab = QWidget()
+        form = QFormLayout(res_tab)
+        form.setContentsMargins(12, 14, 12, 10)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(12)
+
+        self.cpu_slider = ThemeSlider(load_theme())
+        self.cpu_slider.setRange(1, cpu_max)
+        self.cpu_slider.setValue(min(int(settings.get("cpu_threads", max(1, cpu_max // 2))), cpu_max))
+        self.cpu_slider.setMinimumWidth(220)
+        self.cpu_value_lbl = QLabel()
+        self.cpu_value_lbl.setMinimumWidth(80)
+        self.cpu_slider.valueChanged.connect(self._refresh_labels)
+        cpu_row = QHBoxLayout()
+        cpu_row.setContentsMargins(0, 0, 0, 0)
+        cpu_row.setSpacing(10)
+        cpu_row.addWidget(self.cpu_slider, 1)
+        cpu_row.addWidget(self.cpu_value_lbl)
+        cpu_wrap = QWidget()
+        cpu_wrap.setLayout(cpu_row)
+        form.addRow(QLabel("CPU threads:"), cpu_wrap)
+
+        self.ram_cap_check = QCheckBox("Hard RAM cap")
+        cap_tip = (
+            "Run the transcription worker inside a systemd cgroup with a "
+            "memory ceiling. If it exceeds the cap, the kernel kills the "
+            "worker (the GUI shows an OOM error) instead of letting it "
+            "swap or eat the whole machine."
+        )
+        self.ram_cap_check.setToolTip(cap_tip)
+        if not _systemd_run_available():
+            self.ram_cap_check.setEnabled(False)
+            self.ram_cap_check.setToolTip(
+                "systemd-run not found on PATH — hard cap unavailable."
+            )
+        self.ram_cap_check.setChecked(bool(settings.get("ram_cap_enabled", False)))
+
+        self.ram_cap_slider = ThemeSlider(load_theme())
+        self.ram_cap_slider.setRange(1, ram_max)
+        self.ram_cap_slider.setValue(
+            min(int(settings.get("ram_cap_gb", max(2, ram_max // 2))), ram_max)
+        )
+        self.ram_cap_slider.setMinimumWidth(220)
+        self.ram_cap_slider.setEnabled(self.ram_cap_check.isChecked())
+        self.ram_cap_slider.setToolTip(cap_tip)
+        self.ram_cap_value_lbl = QLabel()
+        self.ram_cap_value_lbl.setMinimumWidth(80)
+        self.ram_cap_check.toggled.connect(self.ram_cap_slider.setEnabled)
+        self.ram_cap_check.toggled.connect(lambda _: self._refresh_labels())
+        self.ram_cap_slider.valueChanged.connect(self._refresh_labels)
+        ram_row = QHBoxLayout()
+        ram_row.setContentsMargins(0, 0, 0, 0)
+        ram_row.setSpacing(10)
+        ram_row.addWidget(self.ram_cap_check)
+        ram_row.addWidget(self.ram_cap_slider, 1)
+        ram_row.addWidget(self.ram_cap_value_lbl)
+        ram_widget = QWidget()
+        ram_widget.setLayout(ram_row)
+        form.addRow(ram_widget)
+
+        self.lang_edit = QLineEdit()
+        self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
+        self.lang_edit.setText(settings.get("language", ""))
+        form.addRow(QLabel("Language:"), self.lang_edit)
+
+        tabs.addTab(res_tab, "Resources")
+
+        layout.addWidget(tabs, 1)
 
         bb = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         layout.addWidget(bb)
 
-    def selected(self) -> str | None:
+        self._refresh_labels()
+        self._refresh_action()
+
+    # --- public accessors used by MainWindow on accept ----------------
+    def selected_model(self) -> str | None:
         return self.picker.selected()
 
+    def cpu_threads(self) -> int:
+        return self.cpu_slider.value()
 
-# --- Settings dialog ----------------------------------------------------
+    def ram_cap_enabled(self) -> bool:
+        return self.ram_cap_check.isChecked() and _systemd_run_available()
 
-class SettingsDialog(QDialog):
-    modelsChanged = pyqtSignal()
+    def ram_cap_gb(self) -> int:
+        return self.ram_cap_slider.value()
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Settings — Models")
-        self.resize(600, 440)
-        self._download_worker: DownloadWorker | None = None
+    def language(self) -> str:
+        return self.lang_edit.text().strip()
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            f"Models cache: {WHISPER_CACHE}\n"
-            "Download or delete Whisper models. Sizes shown are approximate."
-        ))
+    # --- internals ----------------------------------------------------
+    def _refresh_labels(self) -> None:
+        self.cpu_value_lbl.setText(f"{self.cpu_slider.value()}/{self._cpu_max} threads")
+        if self.ram_cap_check.isChecked():
+            self.ram_cap_value_lbl.setText(
+                f"{self.ram_cap_slider.value()}/{self._ram_max} GB"
+            )
+        else:
+            self.ram_cap_value_lbl.setText(f"off · max {self._ram_max} GB")
 
-        self.table = QTableWidget(len(MODELS), 4)
-        self.table.setHorizontalHeaderLabels(["Model", "Status", "Size", "Action"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        layout.addWidget(self.table)
+    def _refresh_action(self) -> None:
+        name = self.picker.selected()
+        if not name:
+            self.action_btn.setEnabled(False)
+            self.action_btn.setText("Select a model…")
+            return
+        self.action_btn.setEnabled(True)
+        if is_model_downloaded(name):
+            size = human_size(model_disk_size(name))
+            self.action_btn.setText(f"Delete {name} ({size})")
+        else:
+            dl_mb = next((d for n, d, _ in MODELS if n == name), 0)
+            self.action_btn.setText(f"Download {name} (~{dl_mb} MB)")
 
-        self.status = QLabel("")
-        layout.addWidget(self.status)
+    def _toggle_action(self) -> None:
+        name = self.picker.selected()
+        if not name:
+            return
+        if is_model_downloaded(name):
+            self._delete_model(name)
+        else:
+            self._download_model(name)
 
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        bb.rejected.connect(self.reject)
-        bb.accepted.connect(self.accept)
-        layout.addWidget(bb)
-
-        self.refresh()
-
-    def refresh(self) -> None:
-        for row, (name, dl_mb, ram_gb) in enumerate(MODELS):
-            downloaded = is_model_downloaded(name)
-            self.table.setItem(row, 0, QTableWidgetItem(name))
-            self.table.setItem(row, 1, QTableWidgetItem("✓ downloaded" if downloaded else "not downloaded"))
-            size_text = human_size(model_disk_size(name)) if downloaded else f"~{dl_mb} MB · ~{ram_gb:.0f} GB RAM"
-            self.table.setItem(row, 2, QTableWidgetItem(size_text))
-
-            btn = QPushButton("Delete" if downloaded else "Download")
-            if downloaded:
-                btn.clicked.connect(lambda _, n=name: self.delete_model(n))
-            else:
-                btn.clicked.connect(lambda _, n=name: self.download_model(n))
-            self.table.setCellWidget(row, 3, btn)
-        self.table.resizeColumnsToContents()
-        self.table.horizontalHeader().setStretchLastSection(True)
-
-    def delete_model(self, name: str) -> None:
+    def _delete_model(self, name: str) -> None:
         path = model_cache_path(name)
         if not path.exists():
             return
@@ -1633,30 +1734,34 @@ class SettingsDialog(QDialog):
             return
         try:
             path.unlink()
-            self.status.setText(f"Deleted {name}.")
+            self.dl_status.setText(f"Deleted {name}.")
             self.modelsChanged.emit()
         except Exception as e:
             QMessageBox.critical(self, "Delete failed", str(e))
-        self.refresh()
+        self.picker.refresh()
+        self._refresh_action()
 
-    def download_model(self, name: str) -> None:
+    def _download_model(self, name: str) -> None:
         if self._download_worker and self._download_worker.isRunning():
             QMessageBox.information(self, "Busy", "A download is already running.")
             return
-        self.status.setText(f"Downloading {name}…")
+        self.dl_status.setText(f"Downloading {name}…")
+        self.action_btn.setEnabled(False)
         self._download_worker = DownloadWorker(name)
-        self._download_worker.progress.connect(self.status.setText)
+        self._download_worker.progress.connect(self.dl_status.setText)
         self._download_worker.finished_ok.connect(self._on_download_done)
         self._download_worker.failed.connect(self._on_download_failed)
         self._download_worker.start()
 
     def _on_download_done(self, name: str) -> None:
-        self.status.setText(f"Downloaded {name}.")
+        self.dl_status.setText(f"Downloaded {name}.")
         self.modelsChanged.emit()
-        self.refresh()
+        self.picker.refresh()
+        self._refresh_action()
 
     def _on_download_failed(self, msg: str) -> None:
-        self.status.setText("Download failed.")
+        self.dl_status.setText("Download failed.")
+        self.action_btn.setEnabled(True)
         QMessageBox.critical(self, "Download failed", msg)
 
 
@@ -1744,98 +1849,25 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self.source_tabs)
 
-        # Model — single full-width button summarising the current pick.
-        # Click opens a modal popup; main window stays the same size.
-        self.model_btn = QPushButton()
-        self.model_btn.setObjectName("ModelChooser")
-        self.model_btn.setMinimumHeight(48)
-        self.model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.model_btn.clicked.connect(self.open_model_picker)
-        root.addWidget(self.model_btn)
+        # Model + resource configuration lives in App → Settings.
+        # The main window only shows a compact read-only summary line
+        # so the user knows what's about to run.
+        self._cpu_max = cpu_count()
+        self._ram_max = max(1, int(total_ram_gb()))
+        self._cpu_threads = min(int(self.settings.get("cpu_threads", max(1, self._cpu_max // 2))), self._cpu_max)
+        self._ram_cap_enabled = bool(self.settings.get("ram_cap_enabled", False))
+        self._ram_cap_gb = min(int(self.settings.get("ram_cap_gb", max(2, self._ram_max // 2))), self._ram_max)
+        self._language = self.settings.get("language", "")
+
+        self.config_lbl = QLabel("")
+        self.config_lbl.setProperty("role", "muted")
+        self.config_lbl.setContentsMargins(2, 0, 2, 0)
+        root.addWidget(self.config_lbl)
 
         self.model_warning = QLabel("")
         self.model_warning.setProperty("role", "warning")
         self.model_warning.setContentsMargins(4, 0, 4, 0)
         root.addWidget(self.model_warning)
-
-        # Resources / language. Sliders + N/M label so a full picture
-        # fits on a single line — spinboxes hid the available range.
-        res_box = QGroupBox("Resources")
-        form = QFormLayout(res_box)
-        cpus = cpu_count()
-        ram_total_int = max(1, int(total_ram_gb()))
-
-        self.cpu_slider = ThemeSlider(load_theme())
-        self.cpu_slider.setRange(1, cpus)
-        default_cpu = self.settings.get("cpu_threads", max(1, cpus // 2))
-        self.cpu_slider.setValue(min(default_cpu, cpus))
-        self.cpu_slider.setMinimumWidth(180)
-        self.cpu_slider.setToolTip(f"1 – {cpus} CPU threads available")
-        self.cpu_value_lbl = QLabel()
-        self.cpu_value_lbl.setMinimumWidth(80)
-        self.cpu_slider.valueChanged.connect(self._refresh_resource_labels)
-        cpu_row = QHBoxLayout()
-        cpu_row.setContentsMargins(0, 0, 0, 0)
-        cpu_row.setSpacing(10)
-        cpu_row.addWidget(self.cpu_slider, 1)
-        cpu_row.addWidget(self.cpu_value_lbl)
-        cpu_wrap = QWidget()
-        cpu_wrap.setLayout(cpu_row)
-        form.addRow(QLabel("CPU threads:"), cpu_wrap)
-
-        # Hard RAM cap. Checkbox toggles, slider sets the value.
-        self.ram_cap_check = QCheckBox("Hard RAM cap")
-        cap_tip = (
-            "Run the transcription worker inside a systemd cgroup with a "
-            "memory ceiling. If it tries to use more than the cap, the "
-            "kernel kills the worker process (the GUI shows an OOM error) "
-            "instead of letting it swap or eat the whole machine.\n\n"
-            "Use it when running heavy models you don't want monopolising "
-            "RAM. Don't use it casually — picking a cap below the model's "
-            "actual need (e.g. cap=4 GB with large-v3) just causes an OOM "
-            "right after model load."
-        )
-        self.ram_cap_check.setToolTip(cap_tip)
-        if not _systemd_run_available():
-            self.ram_cap_check.setEnabled(False)
-            self.ram_cap_check.setToolTip(
-                "systemd-run not found on PATH — hard cap unavailable."
-            )
-        self.ram_cap_check.setChecked(bool(self.settings.get("ram_cap_enabled", False)))
-
-        self.ram_cap_slider = ThemeSlider(load_theme())
-        self.ram_cap_slider.setRange(1, ram_total_int)
-        self.ram_cap_slider.setValue(
-            min(self.settings.get("ram_cap_gb", max(2, ram_total_int // 2)), ram_total_int)
-        )
-        self.ram_cap_slider.setMinimumWidth(180)
-        self.ram_cap_slider.setEnabled(self.ram_cap_check.isChecked())
-        self.ram_cap_slider.setToolTip(cap_tip)
-        self.ram_cap_value_lbl = QLabel()
-        self.ram_cap_value_lbl.setMinimumWidth(80)
-        self.ram_cap_check.toggled.connect(self.ram_cap_slider.setEnabled)
-        self.ram_cap_check.toggled.connect(lambda _: self._refresh_resource_labels())
-        self.ram_cap_slider.valueChanged.connect(self._refresh_resource_labels)
-        ram_row = QHBoxLayout()
-        ram_row.setContentsMargins(0, 0, 0, 0)
-        ram_row.setSpacing(10)
-        ram_row.addWidget(self.ram_cap_check)
-        ram_row.addWidget(self.ram_cap_slider, 1)
-        ram_row.addWidget(self.ram_cap_value_lbl)
-        ram_widget = QWidget()
-        ram_widget.setLayout(ram_row)
-        form.addRow(ram_widget)
-
-        self.lang_edit = QLineEdit()
-        self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
-        self.lang_edit.setText(self.settings.get("language", ""))
-        form.addRow(QLabel("Language:"), self.lang_edit)
-
-        self._cpu_max = cpus
-        self._ram_max = ram_total_int
-        self._refresh_resource_labels()
-
-        root.addWidget(res_box)
 
         # Action buttons
         btns = QHBoxLayout()
@@ -2051,58 +2083,44 @@ class MainWindow(QMainWindow):
         return (result, source, widget if isinstance(widget, QTextEdit) else None)
 
     # --- resources ------------------------------------------------------
-    def _refresh_resource_labels(self) -> None:
-        self.cpu_value_lbl.setText(f"{self.cpu_slider.value()}/{self._cpu_max} threads")
-        if self.ram_cap_check.isChecked():
-            self.ram_cap_value_lbl.setText(
-                f"{self.ram_cap_slider.value()}/{self._ram_max} GB"
-            )
-        else:
-            self.ram_cap_value_lbl.setText(f"off · max {self._ram_max} GB")
-
     def _set_current_model(self, name: str, *, preload: bool = True) -> None:
         self._current_model = name
-        self._update_model_button()
+        self._update_config_label()
         self._update_model_warning(name)
         # Kick off a background load so the next Start has the model
-        # already in RAM. Skipped only when explicitly disabled (e.g.
-        # initial selection during boot before the worker is wired).
+        # already in RAM.
         if preload and is_model_downloaded(name) and not self.worker.is_running():
-            ram_cap_gb = self._current_ram_cap_gb()
-            self.worker.preload(name, self.cpu_slider.value(), ram_cap_gb)
+            self.worker.preload(name, self._cpu_threads, self._current_ram_cap_gb())
 
     def _current_ram_cap_gb(self) -> int:
-        if self.ram_cap_check.isChecked() and _systemd_run_available():
-            return self.ram_cap_slider.value()
+        if self._ram_cap_enabled and _systemd_run_available():
+            return self._ram_cap_gb
         return 0
 
-    def _update_model_button(self) -> None:
+    def _update_config_label(self) -> None:
         name = self._current_model
         if not name:
-            self.model_btn.setText("Choose a model…")
-            return
-        ram = next((r for n, _, r in MODELS if n == name), 0.0)
-        if is_model_downloaded(name):
-            loaded_marker = "  · loaded" if self.worker._loaded_model == name else ""
-            status = "✓ downloaded" + loaded_marker
-            tail = f"~{ram:.0f} GB RAM"
+            text = "Open Settings to pick a model"
         else:
-            dl = next((d for n, d, _ in MODELS if n == name), 0)
-            status = "not downloaded"
-            tail = f"~{dl} MB to fetch · ~{ram:.0f} GB RAM"
-        self.model_btn.setText(f"  Model:  {name}    {status}    ·    {tail}")
+            ram = next((r for n, _, r in MODELS if n == name), 0.0)
+            if is_model_downloaded(name):
+                loaded = "loaded" if self.worker._loaded_model == name else "ready"
+                model_str = f"{name} · {loaded}"
+            else:
+                model_str = f"{name} · not downloaded"
+            cap_str = f"{self._ram_cap_gb} GB cap" if self._ram_cap_enabled else "no cap"
+            text = (
+                f"Model: {model_str} (~{ram:.0f} GB RAM)   ·   "
+                f"{self._cpu_threads}/{self._cpu_max} threads   ·   "
+                f"{cap_str}   ·   "
+                f"lang: {self._language or 'auto'}"
+            )
+        self.config_lbl.setText(text)
 
     def _on_preload_done(self, name: str) -> None:
         if name == self._current_model:
             self.statusBar().showMessage(f"Model {name} ready")
-            self._update_model_button()
-
-    def open_model_picker(self) -> None:
-        dlg = ModelPickerDialog(self._current_model, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            picked = dlg.selected()
-            if picked and picked in {n for n, *_ in MODELS}:
-                self._set_current_model(picked)
+            self._update_config_label()
 
     def _update_model_warning(self, name: str) -> None:
         # Skip while a transcription is running — the message is only
@@ -2195,10 +2213,10 @@ class MainWindow(QMainWindow):
         if not model_name:
             QMessageBox.information(self, "No model", "Pick a model first.")
             return
-        cpu_threads = self.cpu_slider.value()
-        language = self.lang_edit.text().strip() or None
-        ram_cap_enabled = self.ram_cap_check.isChecked() and _systemd_run_available()
-        ram_cap_gb = self.ram_cap_slider.value() if ram_cap_enabled else 0
+        cpu_threads = self._cpu_threads
+        language = self._language or None
+        ram_cap_enabled = self._ram_cap_enabled and _systemd_run_available()
+        ram_cap_gb = self._ram_cap_gb if ram_cap_enabled else 0
 
         # Pre-flight RAM check (advisory, not enforced)
         ram_need = next((r for n, _, r in MODELS if n == model_name), 0.0)
@@ -2229,8 +2247,8 @@ class MainWindow(QMainWindow):
             "model": model_name,
             "cpu_threads": cpu_threads,
             "language": language or "",
-            "ram_cap_enabled": ram_cap_enabled,
-            "ram_cap_gb": self.ram_cap_slider.value(),
+            "ram_cap_enabled": self._ram_cap_enabled,
+            "ram_cap_gb": self._ram_cap_gb,
         })
         save_settings(self.settings)
 
@@ -2301,7 +2319,7 @@ class MainWindow(QMainWindow):
             (self._current_model or "").replace(".en", ""), 1.0
         )
         # Threads cut wall-clock roughly with sqrt(threads) before plateau.
-        threads = max(1, self.cpu_slider.value())
+        threads = max(1, self._cpu_threads)
         speedup = max(1.0, min(threads, 6) ** 0.6)
         self._estimate_total = max(2.0, duration * factor / speedup)
         self._estimate_started = time.monotonic()
@@ -2347,7 +2365,7 @@ class MainWindow(QMainWindow):
     def on_transcribe_done(self, result: dict) -> None:
         self.last_result = result
         self._add_result_tab(self.current_file or "", result)
-        self._update_model_button()
+        self._update_config_label()
 
         total = len(self._file_queue)
         # Auto-save TXT next to source file — only meaningful for batch.
@@ -2439,10 +2457,48 @@ class MainWindow(QMainWindow):
 
     # --- misc -----------------------------------------------------------
     def open_settings(self) -> None:
-        dlg = SettingsDialog(self)
-        dlg.modelsChanged.connect(self._update_model_button)
-        dlg.exec()
-        self._update_model_button()
+        dlg = SettingsDialog(
+            self.settings, self._current_model, self._cpu_max, self._ram_max, self,
+        )
+        dlg.modelsChanged.connect(self._update_config_label)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._update_config_label()  # downloads may have happened anyway
+            return
+        # Apply changes
+        new_model = dlg.selected_model()
+        new_cpu = dlg.cpu_threads()
+        new_cap_enabled = dlg.ram_cap_enabled()
+        new_cap_gb = dlg.ram_cap_gb()
+        new_lang = dlg.language()
+
+        cap_changed = (new_cap_enabled, new_cap_gb) != (self._ram_cap_enabled, self._ram_cap_gb)
+        cpu_changed = new_cpu != self._cpu_threads
+
+        self._cpu_threads = new_cpu
+        self._ram_cap_enabled = new_cap_enabled
+        self._ram_cap_gb = new_cap_gb
+        self._language = new_lang
+        self.settings.update({
+            "cpu_threads": new_cpu,
+            "ram_cap_enabled": new_cap_enabled,
+            "ram_cap_gb": new_cap_gb,
+            "language": new_lang,
+        })
+        if new_model:
+            self.settings["model"] = new_model
+        save_settings(self.settings)
+
+        if new_model and new_model != self._current_model:
+            self._set_current_model(new_model)
+        elif cap_changed or cpu_changed:
+            # Cap or thread count change requires restart of the worker
+            # so it picks up the new systemd-run wrap / thread setting.
+            if self._current_model and is_model_downloaded(self._current_model) \
+                    and not self.worker.is_running():
+                self.worker.preload(
+                    self._current_model, self._cpu_threads, self._current_ram_cap_gb()
+                )
+        self._update_config_label()
 
     def show_about(self) -> None:
         QMessageBox.about(
