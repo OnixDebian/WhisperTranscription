@@ -184,6 +184,31 @@ def load_theme() -> dict:
     return theme
 
 
+RUNTIME_DIR = Path.home() / ".cache" / APP_ID
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _arrow_svg_path(direction: str, color: str, suffix: str = "") -> str:
+    """Write a tiny triangle SVG to the runtime cache and return its path.
+
+    Qt 6 stylesheets accept `image: url(/abs/path.svg)` reliably; data:
+    URLs ride a different code path and were rendering blank in our
+    earlier attempt. File-based references just work.
+    """
+    if direction == "up":
+        pts = "4,1 0,5 8,5"
+    else:
+        pts = "0,0 8,0 4,4"
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="8" height="5">'
+        f'<polygon points="{pts}" fill="{color}"/></svg>'
+    )
+    safe_color = color.lstrip("#")
+    path = RUNTIME_DIR / f"arrow-{direction}{suffix}-{safe_color}.svg"
+    path.write_text(svg)
+    return str(path)
+
+
 def build_stylesheet(t: dict) -> str:
     bg = t["background"]
     fg = t["foreground"]
@@ -195,6 +220,10 @@ def build_stylesheet(t: dict) -> str:
     surface_hi = t.get("color8", "#444b6a")      # hover surface
     danger = t.get("color1", "#f7768e")
     success = t.get("color2", "#9ece6a")
+    arrow_up = _arrow_svg_path("up", fg)
+    arrow_down = _arrow_svg_path("down", fg)
+    arrow_up_hot = _arrow_svg_path("up", sel_fg, "-hot")
+    arrow_down_hot = _arrow_svg_path("down", sel_fg, "-hot")
     return f"""
     QMainWindow, QDialog, QWidget {{
         background: {bg};
@@ -290,6 +319,16 @@ def build_stylesheet(t: dict) -> str:
     }}
     QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {accent}; }}
     QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background: {muted}; }}
+    QSpinBox::up-arrow {{
+        image: url({arrow_up});
+        width: 8px; height: 5px;
+    }}
+    QSpinBox::up-button:hover QSpinBox::up-arrow {{ image: url({arrow_up_hot}); }}
+    QSpinBox::down-arrow {{
+        image: url({arrow_down});
+        width: 8px; height: 5px;
+    }}
+    QSpinBox::down-button:hover QSpinBox::down-arrow {{ image: url({arrow_down_hot}); }}
 
     /* Disabled inputs: dashed border + muted text + no spin arrows so it
        reads as "not editable" instead of "looks editable but ignored". */
@@ -394,6 +433,25 @@ def build_stylesheet(t: dict) -> str:
     DropLabel[hasFile="true"] {{
         border-color: {accent};
         color: {fg};
+    }}
+
+    /* Model chooser button: full-width, button-card styled */
+    QPushButton#ModelChooser {{
+        background: {surface};
+        color: {fg};
+        border: 1px solid {border};
+        border-radius: 8px;
+        padding: 12px 14px;
+        text-align: left;
+        font-weight: 600;
+    }}
+    QPushButton#ModelChooser:hover {{
+        background: {surface_hi};
+        border-color: {accent};
+    }}
+    QPushButton#ModelChooser:pressed {{
+        background: {bg};
+        border-color: {accent};
     }}
     """
 
@@ -715,6 +773,51 @@ class ModelPicker(QWidget):
             card.refresh_status()
 
 
+class ModelPickerDialog(QDialog):
+    """Modal popup that lets the user pick a model.
+
+    Why a popup instead of an inline collapsible section: when the
+    inline section opens it expands the main window, but on close the
+    main window does not shrink back — Qt distributes the freed space
+    to the Result text area instead. Wrapping the picker in a modal
+    leaves the main window untouched.
+    """
+
+    def __init__(self, current_model: str | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose model")
+        self.setModal(True)
+        self.resize(640, 540)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel(
+            "Pick a Whisper model. Larger models are more accurate "
+            "but need more RAM and time."
+        ))
+
+        self.picker = ModelPicker()
+        if current_model:
+            self.picker.select(current_model)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.picker)
+        layout.addWidget(scroll, 1)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def selected(self) -> str | None:
+        return self.picker.selected()
+
+
 # --- Settings dialog ----------------------------------------------------
 
 class SettingsDialog(QDialog):
@@ -815,6 +918,7 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self.current_file: str | None = None
         self.last_result: dict | None = None
+        self._current_model: str | None = None
         self.worker = TranscribeProcess(self)
         self.worker.progress.connect(self._on_worker_progress)
         self.worker.finished_ok.connect(self.on_transcribe_done)
@@ -854,20 +958,19 @@ class MainWindow(QMainWindow):
         fbl.addLayout(path_row)
         root.addWidget(file_box)
 
-        # Model picker (always-expanded card list)
-        model_box = QGroupBox("Model")
-        mbl = QVBoxLayout(model_box)
-        self.picker = ModelPicker()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.picker)
-        scroll.setMinimumHeight(220)
-        mbl.addWidget(scroll)
+        # Model — single full-width button summarising the current pick.
+        # Click opens a modal popup; main window stays the same size.
+        self.model_btn = QPushButton()
+        self.model_btn.setObjectName("ModelChooser")
+        self.model_btn.setMinimumHeight(48)
+        self.model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.model_btn.clicked.connect(self.open_model_picker)
+        root.addWidget(self.model_btn)
+
         self.model_warning = QLabel("")
         self.model_warning.setProperty("role", "warning")
-        mbl.addWidget(self.model_warning)
-        self.picker.selectionChanged.connect(self._on_model_changed)
-        root.addWidget(model_box)
+        self.model_warning.setContentsMargins(4, 0, 4, 0)
+        root.addWidget(self.model_warning)
 
         # Resources / language
         res_box = QGroupBox("Resources")
@@ -986,12 +1089,13 @@ class MainWindow(QMainWindow):
 
         # Initial selection: prefer settings, then a downloaded model, then "base"
         last = self.settings.get("model")
-        candidates = (
-            [last] if last else []
-        ) + [n for n, *_ in MODELS if is_model_downloaded(n)] + ["base"]
+        valid = {n for n, *_ in MODELS}
+        candidates = ([last] if last else []) + [
+            n for n, *_ in MODELS if is_model_downloaded(n)
+        ] + ["base"]
         for c in candidates:
-            if c and c in self.picker.cards:
-                self.picker.select(c)
+            if c and c in valid:
+                self._set_current_model(c)
                 break
 
         if initial_file:
@@ -1004,13 +1108,35 @@ class MainWindow(QMainWindow):
         self.sys_info.setText(
             f"System · RAM {avail:.1f} GB available of {total:.1f} GB · {cpu_count()} CPU cores"
         )
-        # also re-check selected-model warning (available RAM moves)
-        sel = self.picker.selected() if hasattr(self, "picker") else None
-        if sel:
-            self._update_model_warning(sel)
+        if self._current_model:
+            self._update_model_warning(self._current_model)
 
-    def _on_model_changed(self, name: str) -> None:
+    def _set_current_model(self, name: str) -> None:
+        self._current_model = name
+        self._update_model_button()
         self._update_model_warning(name)
+
+    def _update_model_button(self) -> None:
+        name = self._current_model
+        if not name:
+            self.model_btn.setText("Choose a model…")
+            return
+        ram = next((r for n, _, r in MODELS if n == name), 0.0)
+        if is_model_downloaded(name):
+            status = "✓ downloaded"
+            tail = f"~{ram:.0f} GB RAM"
+        else:
+            dl = next((d for n, d, _ in MODELS if n == name), 0)
+            status = "not downloaded"
+            tail = f"~{dl} MB to fetch · ~{ram:.0f} GB RAM"
+        self.model_btn.setText(f"  Model:  {name}    {status}    ·    {tail}")
+
+    def open_model_picker(self) -> None:
+        dlg = ModelPickerDialog(self._current_model, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            picked = dlg.selected()
+            if picked and picked in {n for n, *_ in MODELS}:
+                self._set_current_model(picked)
 
     def _update_model_warning(self, name: str) -> None:
         ram = next((r for n, _, r in MODELS if n == name), 0.0)
@@ -1057,7 +1183,7 @@ class MainWindow(QMainWindow):
         if not self.current_file:
             QMessageBox.information(self, "No file", "Pick a file first.")
             return
-        model_name = self.picker.selected()
+        model_name = self._current_model
         if not model_name:
             QMessageBox.information(self, "No model", "Pick a model first.")
             return
@@ -1130,7 +1256,7 @@ class MainWindow(QMainWindow):
         self.save_btn.setEnabled(True)
         self.statusBar().showMessage("Done")
         self.set_running(False)
-        self.picker.refresh()  # in case the model just got downloaded mid-run
+        self._update_model_button()  # in case the model got downloaded mid-run
 
     def on_transcribe_failed(self, msg: str) -> None:
         self.set_running(False)
@@ -1193,9 +1319,9 @@ class MainWindow(QMainWindow):
     # --- misc -----------------------------------------------------------
     def open_settings(self) -> None:
         dlg = SettingsDialog(self)
-        dlg.modelsChanged.connect(self.picker.refresh)
+        dlg.modelsChanged.connect(self._update_model_button)
         dlg.exec()
-        self.picker.refresh()
+        self._update_model_button()
 
     def show_about(self) -> None:
         QMessageBox.about(
