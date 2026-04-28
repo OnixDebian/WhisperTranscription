@@ -2121,7 +2121,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setSpacing(10)
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(6)
 
         # System info bar (live) — kept bright like terminal text
         self.sys_info = QLabel()
@@ -2141,7 +2142,8 @@ class MainWindow(QMainWindow):
 
         file_tab = QWidget()
         fbl = QVBoxLayout(file_tab)
-        fbl.setContentsMargins(10, 12, 10, 10)
+        fbl.setContentsMargins(4, 6, 4, 4)
+        fbl.setSpacing(6)
         self.drop = DropLabel()
         self.drop.filesDropped.connect(self.set_files)
         fbl.addWidget(self.drop)
@@ -2158,7 +2160,7 @@ class MainWindow(QMainWindow):
 
         record_tab = QWidget()
         rec_layout = QVBoxLayout(record_tab)
-        rec_layout.setContentsMargins(10, 12, 10, 10)
+        rec_layout.setContentsMargins(4, 6, 4, 4)
         self.record_panel = RecordPanel()
         self.record_panel.fileRecorded.connect(self._on_recording_finished)
         self.record_panel.statusMessage.connect(self.statusBar().showMessage)
@@ -2167,7 +2169,7 @@ class MainWindow(QMainWindow):
 
         live_tab = QWidget()
         live_layout = QVBoxLayout(live_tab)
-        live_layout.setContentsMargins(10, 12, 10, 10)
+        live_layout.setContentsMargins(4, 6, 4, 4)
         self.live_panel = LivePanel()
         self.live_panel.set_default_language(self.settings.get("language", ""))
         self.live_panel.chunkRecorded.connect(self._on_live_chunk_recorded)
