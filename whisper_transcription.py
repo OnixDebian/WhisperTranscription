@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,7 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QProcess, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QGuiApplication, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -502,12 +503,23 @@ class TranscribeProcess(QObject):
     """
 
     progress = pyqtSignal(str)
+    progress_pct = pyqtSignal(int)
     finished_ok = pyqtSignal(dict)
     failed = pyqtSignal(str)
+
+    # tqdm overwrites a single line with carriage returns:
+    # "  0%|          | 0/2669 [00:00<?, ?frames/s]"
+    # "100%|██████████| 2669/2669 [00:37<00:00, 70.72frames/s]"
+    _TQDM_RE = re.compile(r"^\s*(\d{1,3})%\|")
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.proc = QProcess(self)
+        # Force unbuffered Python in the worker so tqdm progress lines
+        # arrive promptly instead of being held in stdio buffers.
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        self.proc.setProcessEnvironment(env)
         self.proc.readyReadStandardError.connect(self._on_stderr)
         self.proc.finished.connect(self._on_finished)
         self.proc.errorOccurred.connect(self._on_error)
@@ -581,15 +593,32 @@ class TranscribeProcess(QObject):
     def _on_stderr(self) -> None:
         data = bytes(self.proc.readAllStandardError()).decode("utf-8", errors="replace")
         self._stderr_buf += data
-        while "\n" in self._stderr_buf:
-            line, self._stderr_buf = self._stderr_buf.split("\n", 1)
-            line = line.rstrip()
+        # Split on both \n and \r — tqdm uses \r to overwrite the same
+        # progress line, so percentages would otherwise pile up in a
+        # single un-terminated line forever.
+        while True:
+            nl = self._stderr_buf.find("\n")
+            cr = self._stderr_buf.find("\r")
+            if nl == -1 and cr == -1:
+                break
+            if nl == -1:
+                idx = cr
+            elif cr == -1:
+                idx = nl
+            else:
+                idx = min(nl, cr)
+            line = self._stderr_buf[:idx].strip()
+            self._stderr_buf = self._stderr_buf[idx + 1:]
             if not line:
                 continue
             if line.startswith("[STATUS] "):
                 self.progress.emit(line[len("[STATUS] "):])
-            else:
-                self._stderr_log.append(line)
+                continue
+            m = self._TQDM_RE.match(line)
+            if m:
+                self.progress_pct.emit(int(m.group(1)))
+                continue
+            self._stderr_log.append(line)
 
     def _on_error(self, _err) -> None:
         # QProcess error — actual handling happens in _on_finished.
@@ -955,6 +984,7 @@ class MainWindow(QMainWindow):
         self._current_model: str | None = None
         self.worker = TranscribeProcess(self)
         self.worker.progress.connect(self._on_worker_progress)
+        self.worker.progress_pct.connect(self._on_worker_progress_pct)
         self.worker.finished_ok.connect(self.on_transcribe_done)
         self.worker.failed.connect(self.on_transcribe_failed)
 
@@ -1287,6 +1317,17 @@ class MainWindow(QMainWindow):
 
     def _on_worker_progress(self, msg: str) -> None:
         self.statusBar().showMessage(msg)
+        # New phase (e.g. 'Loading model…' → 'Transcribing…') restarts
+        # tqdm at 0%. Reset the bar to indeterminate until the next
+        # percentage arrives so it doesn't stick at 100% from the
+        # previous phase (model download).
+        self.progress.setRange(0, 0)
+        self.progress.setValue(0)
+
+    def _on_worker_progress_pct(self, pct: int) -> None:
+        if self.progress.maximum() != 100:
+            self.progress.setRange(0, 100)
+        self.progress.setValue(max(0, min(100, pct)))
 
     def cancel_transcription(self) -> None:
         if self.worker.is_running():
@@ -1299,10 +1340,10 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         self.progress.setVisible(running)
-        # The pre-flight RAM warning only matters before the run is started:
-        # once the worker is going either it OOMs (handled separately) or
-        # not, the warning is just noise. Restore it when run finishes.
         if running:
+            # Start indeterminate; flip to percentage once tqdm reports.
+            self.progress.setRange(0, 0)
+            self.progress.setValue(0)
             self.model_warning.setVisible(False)
         else:
             self.model_warning.setVisible(bool(self.model_warning.text()))
