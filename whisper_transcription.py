@@ -553,7 +553,7 @@ def build_stylesheet(t: dict) -> str:
         border: 2px dashed {border};
         border-radius: 8px;
         color: {muted};
-        padding: 8px;
+        padding: 4px;
         font-weight: 500;
     }}
     DropLabel[hasFile="true"] {{
@@ -2122,8 +2122,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(8, 6, 8, 6)
-        root.setSpacing(6)
+        root.setContentsMargins(8, 4, 8, 4)
+        root.setSpacing(2)
 
         # System info bar (live) — kept bright like terminal text
         self.sys_info = QLabel()
@@ -2156,8 +2156,8 @@ class MainWindow(QMainWindow):
 
         file_tab = QWidget()
         fbl = QVBoxLayout(file_tab)
-        fbl.setContentsMargins(4, 6, 4, 4)
-        fbl.setSpacing(6)
+        fbl.setContentsMargins(0, 0, 0, 0)
+        fbl.setSpacing(2)
         self.drop = DropLabel()
         self.drop.filesDropped.connect(self.set_files)
         fbl.addWidget(self.drop)
