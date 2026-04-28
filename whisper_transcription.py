@@ -209,11 +209,31 @@ def _arrow_svg_path(direction: str, color: str, suffix: str = "") -> str:
     return str(path)
 
 
+def _check_svg_path(color: str) -> str:
+    """Tick-shaped SVG used inside the checked-state QCheckBox indicator."""
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" '
+        f'viewBox="0 0 14 14" fill="none">'
+        f'<polyline points="3,7 6,10 11,4" stroke="{color}" stroke-width="2" '
+        f'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    )
+    safe_color = color.lstrip("#")
+    path = RUNTIME_DIR / f"check-{safe_color}.svg"
+    path.write_text(svg)
+    return str(path)
+
+
 def build_stylesheet(t: dict) -> str:
     bg = t["background"]
     fg = t["foreground"]
     accent = t.get("accent") or t.get("color4", "#7aa2f7")
+    # NOTE: theme's `selection_foreground` can be a light color (e.g.
+    # #c0caf5 in Tokyo Night) which is fine for highlighted text on a
+    # dark selection, but for our primary button (light blue accent
+    # background) it gives near-zero contrast. Force a dark on-accent
+    # text so 'Start transcription' is always legible.
     sel_fg = t.get("selection_foreground", bg)
+    on_accent = bg  # always dark — used for buttons/menus painted with `accent`.
     border = t.get("color8", "#444b6a")          # structural lines only
     muted = t.get("color7", "#787c99")           # readable secondary text
     surface = t.get("color0", "#32344a")
@@ -222,8 +242,9 @@ def build_stylesheet(t: dict) -> str:
     success = t.get("color2", "#9ece6a")
     arrow_up = _arrow_svg_path("up", fg)
     arrow_down = _arrow_svg_path("down", fg)
-    arrow_up_hot = _arrow_svg_path("up", sel_fg, "-hot")
-    arrow_down_hot = _arrow_svg_path("down", sel_fg, "-hot")
+    arrow_up_hot = _arrow_svg_path("up", on_accent, "-hot")
+    arrow_down_hot = _arrow_svg_path("down", on_accent, "-hot")
+    check_mark = _check_svg_path(on_accent)
     return f"""
     QMainWindow, QDialog, QWidget {{
         background: {bg};
@@ -258,12 +279,12 @@ def build_stylesheet(t: dict) -> str:
     }}
     QPushButton:hover {{
         background: {accent};
-        color: {sel_fg};
+        color: {on_accent};
         border-color: {accent};
     }}
     QPushButton:pressed {{
         background: {muted};
-        color: {sel_fg};
+        color: {on_accent};
         border-color: {muted};
     }}
     QPushButton:focus {{ outline: none; border-color: {accent}; }}
@@ -273,7 +294,7 @@ def build_stylesheet(t: dict) -> str:
         background: {bg};
     }}
     QPushButton[role="primary"] {{
-        background: {accent}; color: {sel_fg}; border-color: {accent}; font-weight: 700;
+        background: {accent}; color: {on_accent}; border-color: {accent}; font-weight: 700;
     }}
     QPushButton[role="primary"]:hover {{ background: {fg}; color: {bg}; border-color: {fg}; }}
     QPushButton[role="primary"]:disabled {{
@@ -288,7 +309,7 @@ def build_stylesheet(t: dict) -> str:
         border-radius: 6px;
         padding: 5px 8px;
         selection-background-color: {accent};
-        selection-color: {sel_fg};
+        selection-color: {on_accent};
     }}
     QLineEdit:focus, QTextEdit:focus, QSpinBox:focus {{ border-color: {accent}; }}
     QLineEdit, QTextEdit {{ placeholder-text-color: {muted}; }}
@@ -346,14 +367,16 @@ def build_stylesheet(t: dict) -> str:
         border: 1px solid {muted};
         border-radius: 4px;
         background: {bg};
+        image: none;
     }}
     QCheckBox::indicator:hover {{ border-color: {accent}; }}
     QCheckBox::indicator:checked {{
         background: {accent};
         border-color: {accent};
+        image: url({check_mark});
     }}
     QCheckBox:disabled {{ color: {muted}; }}
-    QCheckBox:disabled::indicator {{ border-color: {border}; background: {bg}; }}
+    QCheckBox:disabled::indicator {{ border-color: {border}; background: {bg}; image: none; }}
 
     QProgressBar {{
         background: {surface}; color: {fg};
@@ -366,10 +389,10 @@ def build_stylesheet(t: dict) -> str:
     QStatusBar QLabel {{ color: {fg}; }}
     QMenuBar {{ background: {bg}; color: {fg}; }}
     QMenuBar::item {{ padding: 4px 10px; background: transparent; }}
-    QMenuBar::item:selected {{ background: {accent}; color: {sel_fg}; }}
+    QMenuBar::item:selected {{ background: {accent}; color: {on_accent}; }}
     QMenu {{ background: {surface}; color: {fg}; border: 1px solid {border}; padding: 4px; }}
     QMenu::item {{ padding: 6px 18px; }}
-    QMenu::item:selected {{ background: {accent}; color: {sel_fg}; }}
+    QMenu::item:selected {{ background: {accent}; color: {on_accent}; }}
     QHeaderView::section {{ background: {surface}; color: {fg}; border: 0; padding: 6px; }}
     QTableWidget {{
         background: {bg}; color: {fg};
@@ -1179,6 +1202,10 @@ class MainWindow(QMainWindow):
                 self._set_current_model(picked)
 
     def _update_model_warning(self, name: str) -> None:
+        # Skip while a transcription is running — the message is only
+        # actionable before pressing Start.
+        if self.worker.is_running():
+            return
         ram = next((r for n, _, r in MODELS if n == name), 0.0)
         avail = available_ram_gb()
         if ram > avail:
@@ -1191,6 +1218,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.model_warning.setText("")
+        self.model_warning.setVisible(bool(self.model_warning.text()))
 
     # --- file selection -------------------------------------------------
     def pick_file(self) -> None:
@@ -1288,6 +1316,13 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         self.progress.setVisible(running)
+        # The pre-flight RAM warning only matters before the run is started:
+        # once the worker is going either it OOMs (handled separately) or
+        # not, the warning is just noise. Restore it when run finishes.
+        if running:
+            self.model_warning.setVisible(False)
+        else:
+            self.model_warning.setVisible(bool(self.model_warning.text()))
 
     def on_transcribe_done(self, result: dict) -> None:
         self.last_result = result
