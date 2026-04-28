@@ -284,6 +284,22 @@ def slider_stylesheet(t: dict) -> str:
     """
 
 
+def _close_svg_path(color: str, suffix: str = "") -> str:
+    """Tiny `×` SVG used inside QTabBar's close-button slot."""
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" '
+        f'viewBox="0 0 10 10">'
+        f'<line x1="2" y1="2" x2="8" y2="8" stroke="{color}" '
+        f'stroke-width="1.5" stroke-linecap="round"/>'
+        f'<line x1="8" y1="2" x2="2" y2="8" stroke="{color}" '
+        f'stroke-width="1.5" stroke-linecap="round"/></svg>'
+    )
+    safe = color.lstrip("#")
+    path = RUNTIME_DIR / f"close{suffix}-{safe}.svg"
+    path.write_text(svg)
+    return str(path)
+
+
 def _check_svg_path(color: str) -> str:
     """Tick-shaped SVG used inside the checked-state QCheckBox indicator."""
     svg = (
@@ -320,6 +336,8 @@ def build_stylesheet(t: dict) -> str:
     arrow_up_hot = _arrow_svg_path("up", on_accent, "-hot")
     arrow_down_hot = _arrow_svg_path("down", on_accent, "-hot")
     check_mark = _check_svg_path(on_accent)
+    close_icon = _close_svg_path(muted)
+    close_icon_hot = _close_svg_path(on_accent, "-hot")
     return f"""
     QMainWindow, QDialog, QWidget {{
         background-color: {bg};
@@ -557,7 +575,7 @@ def build_stylesheet(t: dict) -> str:
     QTabBar::tab {{
         background: transparent;
         color: {muted};
-        padding: 6px 10px;
+        padding: 6px 8px;
         border: none;
         border-radius: 6px;
         margin: 0 3px 4px 0;
@@ -568,15 +586,23 @@ def build_stylesheet(t: dict) -> str:
         background: {surface_hi};
         color: {accent};
     }}
-    /* Close button on a closeable tab: small, tucked next to the
-       label, accent on hover so it's a real affordance. */
+    /* Close button on a closeable tab: square 14×14 pill with a
+       theme-coloured ×, sitting flush against the label. Default
+       Qt close icon is invisible against our dark theme so we draw
+       our own SVG and reference it explicitly. */
     QTabBar::close-button {{
+        image: url({close_icon});
         subcontrol-position: right;
-        margin: 0 2px 0 6px;
+        width: 14px;
+        height: 14px;
+        margin: 0 2px 0 4px;
         padding: 0;
         border-radius: 3px;
     }}
-    QTabBar::close-button:hover {{ background: {danger}; }}
+    QTabBar::close-button:hover {{
+        image: url({close_icon_hot});
+        background: {danger};
+    }}
     /* QTextEdit inside a tab loses its 1 px border — otherwise it
        paints a horizontal line that pokes out next to the tab pill. */
     QTabWidget QTextEdit {{ border: none; }}
