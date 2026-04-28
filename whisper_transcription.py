@@ -517,6 +517,40 @@ def build_stylesheet(t: dict) -> str:
         border-bottom: 1px solid {bg};
     }}
 
+    /* Segmented control: two/three pill-buttons sharing borders */
+    QPushButton#SegmentBtn {{
+        background: {surface};
+        color: {muted};
+        border: 1px solid {border};
+        padding: 8px 16px;
+        font-weight: 600;
+        border-radius: 0;
+    }}
+    QPushButton#SegmentBtn[position="left"] {{
+        border-top-left-radius: 6px; border-bottom-left-radius: 6px;
+    }}
+    QPushButton#SegmentBtn[position="right"] {{
+        border-top-right-radius: 6px; border-bottom-right-radius: 6px;
+        border-left: none;
+    }}
+    QPushButton#SegmentBtn[position="middle"] {{
+        border-left: none; border-right: none;
+    }}
+    QPushButton#SegmentBtn:hover {{
+        color: {fg};
+        background: {surface_hi};
+    }}
+    QPushButton#SegmentBtn:checked {{
+        background: {accent};
+        color: {on_accent};
+        border: 1px solid {accent};
+    }}
+    QPushButton#SegmentBtn:checked:hover {{
+        background: {fg};
+        color: {bg};
+        border-color: {fg};
+    }}
+
     /* Big record button with red recording state */
     QPushButton#RecordButton {{
         background: {surface};
@@ -875,7 +909,7 @@ class DownloadWorker(QThread):
 # --- Custom widgets -----------------------------------------------------
 
 class DropLabel(QLabel):
-    fileDropped = pyqtSignal(str)
+    filesDropped = pyqtSignal(list)
 
     def __init__(self):
         super().__init__()
@@ -884,7 +918,7 @@ class DropLabel(QLabel):
         self.setMinimumHeight(90)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setProperty("hasFile", "false")
-        self.setText("Drop an audio/video file here  ·  or click Open File…")
+        self.setText("Drop audio/video files here  ·  or click Open File…")
 
     def setHasFile(self, has: bool) -> None:
         self.setProperty("hasFile", "true" if has else "false")
@@ -896,10 +930,9 @@ class DropLabel(QLabel):
             e.acceptProposedAction()
 
     def dropEvent(self, e: QDropEvent) -> None:
-        for url in e.mimeData().urls():
-            if url.isLocalFile():
-                self.fileDropped.emit(url.toLocalFile())
-                return
+        paths = [url.toLocalFile() for url in e.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self.filesDropped.emit(paths)
 
 
 class ModelCard(QFrame):
@@ -1010,6 +1043,61 @@ class ModelPicker(QWidget):
             card.refresh_status()
 
 
+class SegmentedControl(QWidget):
+    """Two- or three-segment toggle. Reads as a single visual unit, not
+    as scattered radio buttons. Used for Source / Trigger choices in
+    the Record panel where the radios were too inconspicuous."""
+
+    valueChanged = pyqtSignal(str)
+
+    def __init__(self, options: list[tuple[str, str]], default: str = "",
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self._buttons: dict[str, QPushButton] = {}
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        for i, (value, label) in enumerate(options):
+            btn = QPushButton(label)
+            btn.setObjectName("SegmentBtn")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            if i == 0:
+                pos = "left"
+            elif i == len(options) - 1:
+                pos = "right"
+            else:
+                pos = "middle"
+            btn.setProperty("position", pos)
+            btn.clicked.connect(lambda _checked, v=value: self.set_value(v))
+            self._group.addButton(btn)
+            layout.addWidget(btn)
+            self._buttons[value] = btn
+        layout.addStretch(1)
+        if default and default in self._buttons:
+            self.set_value(default, emit=False)
+        else:
+            first = next(iter(self._buttons))
+            self.set_value(first, emit=False)
+
+    def set_value(self, value: str, emit: bool = True) -> None:
+        if value not in self._buttons:
+            return
+        for v, btn in self._buttons.items():
+            btn.setChecked(v == value)
+        if emit:
+            self.valueChanged.emit(value)
+
+    def value(self) -> str:
+        for v, btn in self._buttons.items():
+            if btn.isChecked():
+                return v
+        return ""
+
+
 class RecordPanel(QWidget):
     """Live recording into a temp WAV via ffmpeg + PulseAudio.
 
@@ -1039,33 +1127,31 @@ class RecordPanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
-        # Source picker
+        # Source toggle
         src_row = QHBoxLayout()
-        src_row.addWidget(QLabel("Source:"))
-        self.src_mic = QRadioButton("Microphone")
-        self.src_sys = QRadioButton("System audio")
-        self.src_mic.setChecked(True)
-        src_group = QButtonGroup(self)
-        src_group.addButton(self.src_mic)
-        src_group.addButton(self.src_sys)
-        src_row.addWidget(self.src_mic)
-        src_row.addWidget(self.src_sys)
+        src_lbl = QLabel("Source:")
+        src_lbl.setMinimumWidth(70)
+        src_row.addWidget(src_lbl)
+        self.source_toggle = SegmentedControl(
+            [("mic", "Microphone"), ("sys", "System audio")],
+            default="mic",
+        )
+        src_row.addWidget(self.source_toggle)
         src_row.addStretch(1)
         layout.addLayout(src_row)
 
-        # Mode picker
+        # Trigger toggle
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Trigger:"))
-        self.mode_click = QRadioButton("Click to start / stop")
-        self.mode_push = QRadioButton("Push and hold")
-        self.mode_click.setChecked(True)
-        mode_group = QButtonGroup(self)
-        mode_group.addButton(self.mode_click)
-        mode_group.addButton(self.mode_push)
-        mode_row.addWidget(self.mode_click)
-        mode_row.addWidget(self.mode_push)
+        mode_lbl = QLabel("Trigger:")
+        mode_lbl.setMinimumWidth(70)
+        mode_row.addWidget(mode_lbl)
+        self.mode_toggle = SegmentedControl(
+            [("click", "Click to start / stop"), ("push", "Push and hold")],
+            default="click",
+        )
+        mode_row.addWidget(self.mode_toggle)
         mode_row.addStretch(1)
         layout.addLayout(mode_row)
 
@@ -1093,8 +1179,7 @@ class RecordPanel(QWidget):
                 "pactl not found — recording will use the default Pulse source"
             )
 
-        self.mode_click.toggled.connect(lambda _: self._refresh_button_text())
-        self.mode_push.toggled.connect(lambda _: self._refresh_button_text())
+        self.mode_toggle.valueChanged.connect(lambda _: self._refresh_button_text())
         self._refresh_button_text()
 
     # --- public ---------------------------------------------------------
@@ -1105,11 +1190,17 @@ class RecordPanel(QWidget):
         if self.is_recording():
             self._stop_recording()
 
+    def _is_push_mode(self) -> bool:
+        return self.mode_toggle.value() == "push"
+
+    def _is_mic(self) -> bool:
+        return self.source_toggle.value() == "mic"
+
     # --- handlers -------------------------------------------------------
     def _on_clicked(self) -> None:
         # `clicked` fires after `released`; in push-and-hold mode the
         # release already stopped the recording — ignore.
-        if self.mode_push.isChecked():
+        if self._is_push_mode():
             return
         if self.is_recording():
             self._stop_recording()
@@ -1117,16 +1208,16 @@ class RecordPanel(QWidget):
             self._start_recording()
 
     def _on_pressed(self) -> None:
-        if self.mode_push.isChecked() and not self.is_recording():
+        if self._is_push_mode() and not self.is_recording():
             self._start_recording()
 
     def _on_released(self) -> None:
-        if self.mode_push.isChecked() and self.is_recording():
+        if self._is_push_mode() and self.is_recording():
             self._stop_recording()
 
     # --- recording ------------------------------------------------------
     def _resolve_source(self) -> str:
-        if self.src_mic.isChecked():
+        if self._is_mic():
             return "default"
         # System audio: ask pactl for the default sink and use its monitor.
         if shutil.which("pactl"):
@@ -1168,7 +1259,7 @@ class RecordPanel(QWidget):
         self._tick_timer.start()
         self._refresh_button_text()
         self.statusMessage.emit(
-            f"Recording from {'microphone' if self.src_mic.isChecked() else 'system audio'}…"
+            f"Recording from {'microphone' if self._is_mic() else 'system audio'}…"
         )
 
     def _stop_recording(self) -> None:
@@ -1206,7 +1297,7 @@ class RecordPanel(QWidget):
         self.record_btn.setProperty("recording", "true" if recording else "false")
         if recording:
             self.record_btn.setText("⏹  Stop recording")
-        elif self.mode_push.isChecked():
+        elif self._is_push_mode():
             self.record_btn.setText("⏺  Push and hold to record")
         else:
             self.record_btn.setText("⏺  Click to record")
@@ -1375,6 +1466,8 @@ class MainWindow(QMainWindow):
         else:
             self.resize(720, 820)
         self.current_file: str | None = None
+        self._file_queue: list[str] = []
+        self._batch_index: int = 0
         self.last_result: dict | None = None
         self._current_model: str | None = None
         self.worker = TranscribeProcess(self)
@@ -1412,14 +1505,14 @@ class MainWindow(QMainWindow):
         fbl = QVBoxLayout(file_tab)
         fbl.setContentsMargins(10, 12, 10, 10)
         self.drop = DropLabel()
-        self.drop.fileDropped.connect(self.set_file)
+        self.drop.filesDropped.connect(self.set_files)
         fbl.addWidget(self.drop)
         path_row = QHBoxLayout()
         self.file_edit = QLineEdit()
         self.file_edit.setPlaceholderText("No file selected")
         self.file_edit.setReadOnly(True)
-        open_btn = QPushButton("Open File…")
-        open_btn.clicked.connect(self.pick_file)
+        open_btn = QPushButton("Open Files…")
+        open_btn.clicked.connect(self.pick_files)
         path_row.addWidget(self.file_edit, 1)
         path_row.addWidget(open_btn)
         fbl.addLayout(path_row)
@@ -1668,47 +1761,71 @@ class MainWindow(QMainWindow):
         self.model_warning.setVisible(bool(self.model_warning.text()))
 
     # --- file selection -------------------------------------------------
-    def pick_file(self) -> None:
+    def pick_files(self) -> None:
         last_folder = self.settings.get("last_folder")
         start_dir = last_folder if last_folder and Path(last_folder).is_dir() else str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select audio or video file", start_dir,
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select audio or video files (Ctrl/Shift to multi-select)", start_dir,
             "Media (*.wav *.mp3 *.m4a *.flac *.ogg *.opus *.mp4 *.mkv *.webm *.mov *.avi);;All files (*)",
         )
-        if path:
-            self.settings["last_folder"] = str(Path(path).parent)
-            save_settings(self.settings)
-            self.set_file(path)
+        if paths:
+            self.set_files(paths)
 
-    def set_file(self, path: str) -> None:
-        p = Path(path)
-        if not p.exists():
-            QMessageBox.warning(self, "Not found", f"File does not exist:\n{path}")
+    def set_files(self, paths: list[str]) -> None:
+        """Accept one or more files. Single → behaves as before. Many →
+        queued for sequential transcription (each result is auto-saved
+        as <basename>.txt next to its source)."""
+        valid: list[str] = []
+        unknown_asked = False
+        for path in paths:
+            p = Path(path)
+            if not p.exists():
+                continue
+            if p.suffix.lower() not in AUDIO_EXTS:
+                if not unknown_asked:
+                    ok = QMessageBox.question(
+                        self, "Unknown extension(s)",
+                        "Some files have unrecognised audio/video extensions. "
+                        "Include them anyway?",
+                    )
+                    unknown_asked = True
+                    if ok != QMessageBox.StandardButton.Yes:
+                        continue
+                # If user already said yes once, accept the rest with same ext.
+            valid.append(str(p))
+        if not valid:
+            QMessageBox.warning(self, "No usable files", "None of the dropped paths exist.")
             return
-        if p.suffix.lower() not in AUDIO_EXTS:
-            ok = QMessageBox.question(
-                self, "Unknown extension",
-                f"{p.suffix} is not a recognized audio/video extension. Continue?",
-            )
-            if ok != QMessageBox.StandardButton.Yes:
-                return
-        self.current_file = str(p)
-        self.file_edit.setText(self.current_file)
-        self.drop.setText(p.name)
+        self._file_queue = valid
+        self.current_file = valid[0]
+        self.last_result = None
+        self.copy_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        if len(valid) == 1:
+            self.file_edit.setText(self.current_file)
+            self.drop.setText(Path(self.current_file).name)
+        else:
+            head = ", ".join(Path(p).name for p in valid[:3])
+            more = "" if len(valid) <= 3 else f" + {len(valid) - 3} more"
+            self.file_edit.setText(f"{len(valid)} files: {head}{more}")
+            self.drop.setText(f"{len(valid)} files queued")
         self.drop.setHasFile(True)
-        self.settings["last_folder"] = str(p.parent)
+        self.settings["last_folder"] = str(Path(valid[0]).parent)
         save_settings(self.settings)
 
+    def set_file(self, path: str) -> None:
+        # Backwards-compatible single-file entry point used by the
+        # recording panel.
+        self.set_files([path])
+
     def _on_recording_finished(self, path: str) -> None:
-        # Recording panel hands us a fresh WAV — wire it through the same
-        # set_file path so transcription picks it up. Switch to the File
-        # tab so the user sees the picked path is set.
-        self.set_file(path)
-        self.source_tabs.setCurrentIndex(0)
+        # Wire recording into the same pipeline as a picked file. Stay
+        # on the Record tab so the user can keep recording back-to-back.
+        self.set_files([path])
 
     # --- transcription --------------------------------------------------
     def start_transcription(self) -> None:
-        if not self.current_file:
+        if not self._file_queue:
             QMessageBox.information(self, "No file", "Pick a file first.")
             return
         model_name = self._current_model
@@ -1754,13 +1871,41 @@ class MainWindow(QMainWindow):
         })
         save_settings(self.settings)
 
+        # Cache batch parameters so each step uses the same model / cap
+        # even if the user fiddles with the controls mid-batch.
+        self._batch_index = 0
+        self._batch_params = {
+            "model": model_name,
+            "cpu_threads": cpu_threads,
+            "language": language,
+            "ram_cap_gb": ram_cap_gb,
+        }
+
         self.set_running(True)
         self.result_edit.clear()
         self.last_result = None
         self.copy_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
 
-        self.worker.transcribe(self.current_file, model_name, cpu_threads, language, ram_cap_gb)
+        self._run_next_in_batch()
+
+    def _run_next_in_batch(self) -> None:
+        if self._batch_index >= len(self._file_queue):
+            return
+        self.current_file = self._file_queue[self._batch_index]
+        params = self._batch_params
+        total = len(self._file_queue)
+        if total > 1:
+            self.statusBar().showMessage(
+                f"File {self._batch_index + 1}/{total}: {Path(self.current_file).name}"
+            )
+        self.worker.transcribe(
+            self.current_file,
+            params["model"],
+            params["cpu_threads"],
+            params["language"],
+            params["ram_cap_gb"],
+        )
 
     def _on_worker_progress(self, msg: str) -> None:
         # Status bar mirrors phase, the progress bar shows it inline so
@@ -1814,6 +1959,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Cancelling…")
             self.worker.cancel()
             self.statusBar().showMessage("Cancelled")
+        # Drop any remaining files from the batch — user explicitly stopped.
+        self._batch_index = len(self._file_queue)
         self.set_running(False)
 
     def set_running(self, running: bool) -> None:
@@ -1841,14 +1988,38 @@ class MainWindow(QMainWindow):
         self.result_edit.setPlainText(result.get("text", "").strip())
         self.copy_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
-        self.statusBar().showMessage("Done")
+        self._update_model_button()
+
+        total = len(self._file_queue)
+        # Auto-save TXT next to source file — only meaningful for batch.
+        if total > 1 and self.current_file:
+            try:
+                src = Path(self.current_file)
+                txt_path = src.with_suffix(".txt")
+                txt_path.write_text(result.get("text", "").strip(), encoding="utf-8")
+            except Exception as e:
+                self.statusBar().showMessage(
+                    f"Saved transcription failed for {Path(self.current_file).name}: {e}"
+                )
+
+        self._batch_index += 1
+        if self._batch_index < total:
+            self._run_next_in_batch()
+            return
+
+        if total > 1:
+            self.statusBar().showMessage(f"Done — {total} files transcribed")
+        else:
+            self.statusBar().showMessage("Done")
         self.set_running(False)
-        self._update_model_button()  # in case the model got downloaded mid-run
 
     def on_transcribe_failed(self, msg: str) -> None:
         self.set_running(False)
         self.statusBar().showMessage("Failed")
         QMessageBox.critical(self, "Transcription failed", msg)
+        # Stop the batch on failure — likely the same error will hit
+        # the next file too (model load, OOM, etc.).
+        self._batch_index = len(self._file_queue)
 
     # --- output ---------------------------------------------------------
     def copy_result(self) -> None:
