@@ -24,7 +24,7 @@ import time
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QPoint, QProcess, QProcessEnvironment, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QFileSystemWatcher, QObject, QPoint, QProcess, QProcessEnvironment, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QBrush, QColor, QGuiApplication, QDragEnterEvent, QDropEvent, QIcon, QPainter
 from PyQt6.QtWidgets import (
     QApplication,
@@ -714,7 +714,8 @@ class TranscribeProcess(QObject):
     progress = pyqtSignal(str)            # raw [STATUS] message
     progress_pct = pyqtSignal(int)        # tqdm percentage
     preload_done = pyqtSignal(str)        # model name once loaded
-    finished_ok = pyqtSignal(dict)        # transcription result
+    finished_ok = pyqtSignal(dict)        # full transcription result (file mode)
+    live_chunk = pyqtSignal(str)          # short transcription text (live mode)
     failed = pyqtSignal(str)              # transcription failed
 
     # tqdm overwrites a single line with carriage returns:
@@ -737,6 +738,11 @@ class TranscribeProcess(QObject):
         self._active_result_path: str | None = None
         self._spawned_ram_cap_gb: int = -1   # -1 = nothing spawned yet
         self._loaded_model: str | None = None
+        # FIFO of pending transcribes: (result_path, is_live).
+        # Worker processes commands serially so we pop the head when
+        # each [STATUS] Done arrives. is_live routes the result to
+        # live_chunk instead of finished_ok.
+        self._pending: list[tuple[str, bool]] = []
 
     # --- public API -----------------------------------------------------
     def preload(self, model: str, cpu_threads: int, ram_cap_gb: int = 0) -> None:
@@ -760,12 +766,34 @@ class TranscribeProcess(QObject):
         language: str | None,
         ram_cap_gb: int = 0,
     ) -> None:
+        self._send_transcribe(file_path, model, cpu_threads, language, ram_cap_gb, live=False)
+
+    def transcribe_live(
+        self,
+        file_path: str,
+        model: str,
+        cpu_threads: int,
+        language: str | None,
+        ram_cap_gb: int = 0,
+    ) -> None:
+        """Same worker, different result routing — emits live_chunk(text)
+        instead of finished_ok(dict)."""
+        self._send_transcribe(file_path, model, cpu_threads, language, ram_cap_gb, live=True)
+
+    def _send_transcribe(
+        self,
+        file_path: str,
+        model: str,
+        cpu_threads: int,
+        language: str | None,
+        ram_cap_gb: int,
+        live: bool,
+    ) -> None:
         self._ensure_running(ram_cap_gb)
-        # Result is written to a tempfile by the worker, not piped via
-        # stdout — pipes can race or be polluted by stray torch/tqdm output.
         fd, path = tempfile.mkstemp(prefix="whisper-result-", suffix=".json")
         os.close(fd)
         self._active_result_path = path
+        self._pending.append((path, live))
         self._cancelled = False
         self._send({
             "action": "transcribe",
@@ -900,16 +928,25 @@ class TranscribeProcess(QObject):
                 self._active_result_path = None
 
     def _deliver_result(self) -> None:
-        path = self._active_result_path
-        self._active_result_path = None
-        if not path:
+        # Pop the matching command from the FIFO and route the result
+        # to live_chunk vs finished_ok.
+        if not self._pending:
+            self._active_result_path = None
             return
+        path, is_live = self._pending.pop(0)
+        # Sync _active_result_path with whatever's still in the queue.
+        self._active_result_path = (
+            self._pending[0][0] if self._pending else None
+        )
         try:
             if not Path(path).exists():
                 raise FileNotFoundError("worker did not write the result file")
             with open(path, "r", encoding="utf-8") as f:
                 result = json.load(f)
-            self.finished_ok.emit(result)
+            if is_live:
+                self.live_chunk.emit(result.get("text", "").strip())
+            else:
+                self.finished_ok.emit(result)
         except Exception as e:
             tail = "\n".join(self._stderr_log[-15:]).strip()
             self.failed.emit(f"Failed to read worker result: {e}\n\n{tail}")
@@ -931,6 +968,14 @@ class TranscribeProcess(QObject):
         # Mark cap state as unspawned so the next call respawns.
         self._spawned_ram_cap_gb = -1
         self._loaded_model = None
+
+        # Drop any pending temp result files.
+        for p, _ in self._pending:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._pending.clear()
 
         path = self._active_result_path
         self._active_result_path = None
@@ -1525,6 +1570,248 @@ class RecordPanel(QWidget):
         self.duration_lbl.setText(f"⏺  {m:02d}:{s:02d}")
 
 
+class LivePanel(QWidget):
+    """Continuous live transcription.
+
+    ffmpeg writes the audio stream to a directory as N-second WAV
+    segments. A QFileSystemWatcher notices each newly-rotated chunk
+    (the previous chunk is closed when ffmpeg starts the next one)
+    and hands it to the persistent worker via transcribe_live(). The
+    worker streams the resulting text back through the live_chunk
+    signal, which appends into the panel's text area.
+    """
+
+    chunkRecorded = pyqtSignal(str)        # path of a closed chunk WAV
+    statusMessage = pyqtSignal(str)
+
+    CHUNK_SECONDS = 3
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._proc: QProcess | None = None
+        self._dir: Path | None = None
+        self._watcher: QFileSystemWatcher | None = None
+        self._processed: set[str] = set()
+        self._started_at: float = 0.0
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(200)
+        self._tick_timer.timeout.connect(self._update_duration)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        # Source toggle (mic / system audio) — same control as Record.
+        src_row = QHBoxLayout()
+        src_lbl = QLabel("Source:")
+        src_lbl.setMinimumWidth(70)
+        src_row.addWidget(src_lbl)
+        self.source_toggle = SegmentedControl(
+            [("mic", "Microphone"), ("sys", "System audio")],
+            default="mic",
+        )
+        src_row.addWidget(self.source_toggle)
+        src_row.addStretch(1)
+        layout.addLayout(src_row)
+
+        # Big Start / Stop button (toggle).
+        self.toggle_btn = QPushButton()
+        self.toggle_btn.setObjectName("RecordButton")
+        self.toggle_btn.setMinimumHeight(64)
+        self.toggle_btn.setProperty("recording", "false")
+        self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle_btn.clicked.connect(self._on_toggle)
+        layout.addWidget(self.toggle_btn)
+
+        self.duration_lbl = QLabel("")
+        self.duration_lbl.setProperty("role", "muted")
+        self.duration_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.duration_lbl)
+
+        # Live transcript area — text accumulates here as chunks are
+        # decoded.
+        self.text = QTextEdit()
+        self.text.setReadOnly(False)
+        self.text.setPlaceholderText(
+            "Live transcription will stream in here as you talk."
+        )
+        self.text.setMinimumHeight(180)
+        layout.addWidget(self.text, 1)
+
+        out_row = QHBoxLayout()
+        self.copy_btn = QPushButton("Copy to clipboard")
+        self.copy_btn.clicked.connect(self._copy)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.text.clear)
+        out_row.addWidget(self.copy_btn)
+        out_row.addWidget(self.clear_btn)
+        out_row.addStretch(1)
+        layout.addLayout(out_row)
+
+        if not shutil.which("ffmpeg"):
+            self.toggle_btn.setEnabled(False)
+            self.toggle_btn.setToolTip("ffmpeg not found — live transcription unavailable")
+        self._refresh_button_text()
+
+    # --- public --------------------------------------------------------
+    def is_recording(self) -> bool:
+        return self._proc is not None and self._proc.state() != QProcess.ProcessState.NotRunning
+
+    def stop_if_recording(self) -> None:
+        if self.is_recording():
+            self._stop()
+
+    def append_text(self, chunk: str) -> None:
+        chunk = chunk.strip()
+        if not chunk:
+            return
+        cursor = self.text.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        existing = self.text.toPlainText()
+        sep = "" if not existing or existing.endswith(("\n", " ")) else " "
+        cursor.insertText(sep + chunk)
+        # Auto-scroll to keep newest at the bottom.
+        self.text.verticalScrollBar().setValue(
+            self.text.verticalScrollBar().maximum()
+        )
+
+    # --- handlers ------------------------------------------------------
+    def _on_toggle(self) -> None:
+        if self.is_recording():
+            self._stop()
+        else:
+            self._start()
+
+    def _resolve_source(self) -> str:
+        if self.source_toggle.value() == "mic":
+            return "default"
+        if shutil.which("pactl"):
+            try:
+                out = subprocess.run(
+                    ["pactl", "info"], capture_output=True, text=True, timeout=2,
+                ).stdout
+                for line in out.splitlines():
+                    if line.startswith("Default Sink:"):
+                        sink = line.split(":", 1)[1].strip()
+                        if sink:
+                            return f"{sink}.monitor"
+            except Exception:
+                pass
+        return "default"
+
+    def _start(self) -> None:
+        # Fresh temp dir per session so old chunks don't leak in.
+        self._dir = Path(tempfile.mkdtemp(prefix="whisper-live-"))
+        self._processed.clear()
+        source = self._resolve_source()
+        # ffmpeg segment muxer — writes chunk-000.wav, chunk-001.wav, …
+        # rotating every CHUNK_SECONDS. Each rotation closes the prior
+        # file (guaranteed valid WAV) and opens the next one.
+        self._proc = QProcess(self)
+        self._proc.setProgram("ffmpeg")
+        self._proc.setArguments([
+            "-loglevel", "error",
+            "-f", "pulse", "-i", source,
+            "-ar", "16000", "-ac", "1",
+            "-f", "segment",
+            "-segment_time", str(self.CHUNK_SECONDS),
+            "-reset_timestamps", "1",
+            str(self._dir / "chunk-%04d.wav"),
+        ])
+        self._proc.finished.connect(self._on_proc_finished)
+        self._proc.start()
+        if not self._proc.waitForStarted(3000):
+            err = self._proc.errorString()
+            self._proc = None
+            self.statusMessage.emit(f"Live: ffmpeg failed to start: {err}")
+            return
+
+        self._watcher = QFileSystemWatcher([str(self._dir)])
+        self._watcher.directoryChanged.connect(self._on_dir_changed)
+        self._started_at = time.monotonic()
+        self._tick_timer.start()
+        self._refresh_button_text()
+        self.statusMessage.emit(
+            f"Listening on {'mic' if self.source_toggle.value() == 'mic' else 'system audio'}…"
+        )
+
+    def _stop(self) -> None:
+        if self._proc:
+            try:
+                self._proc.write(b"q\n")
+                self._proc.closeWriteChannel()
+            except Exception:
+                self._proc.terminate()
+            if not self._proc.waitForFinished(3000):
+                self._proc.kill()
+                self._proc.waitForFinished(1000)
+        if self._watcher:
+            try:
+                self._watcher.removePaths(self._watcher.directories())
+            except Exception:
+                pass
+            self._watcher = None
+        self._tick_timer.stop()
+        # Final flush — process any remaining chunks (including the
+        # last partial one, which is closed once ffmpeg exits).
+        if self._dir:
+            self._on_dir_changed(str(self._dir))
+
+    def _on_proc_finished(self, _exit_code, _exit_status) -> None:
+        self._tick_timer.stop()
+        proc = self._proc
+        self._proc = None
+        self._refresh_button_text()
+        # ffmpeg exited on its own (e.g. mic disconnected). Try to
+        # process whatever chunks landed.
+        if self._dir:
+            self._on_dir_changed(str(self._dir))
+
+    def _on_dir_changed(self, dir_path: str) -> None:
+        files = sorted(Path(dir_path).glob("chunk-*.wav"))
+        if not files:
+            return
+        # If ffmpeg is still running, the newest file is being written
+        # — skip it and process all earlier ones. If ffmpeg has
+        # exited, every file (including the newest) is closed.
+        running = self.is_recording()
+        ready = files[:-1] if running else files
+        for f in ready:
+            key = str(f)
+            if key in self._processed:
+                continue
+            # File needs at least a few KB to be a valid WAV body.
+            try:
+                if f.stat().st_size < 4096:
+                    continue
+            except OSError:
+                continue
+            self._processed.add(key)
+            self.chunkRecorded.emit(key)
+
+    def _refresh_button_text(self) -> None:
+        recording = self.is_recording()
+        self.toggle_btn.setProperty("recording", "true" if recording else "false")
+        self.toggle_btn.setText(
+            "⏹  Stop live transcription"
+            if recording
+            else "⏺  Start live transcription"
+        )
+        self.toggle_btn.style().unpolish(self.toggle_btn)
+        self.toggle_btn.style().polish(self.toggle_btn)
+
+    def _update_duration(self) -> None:
+        if not self.is_recording():
+            return
+        secs = time.monotonic() - self._started_at
+        m, s = divmod(int(secs), 60)
+        self.duration_lbl.setText(f"⏺  {m:02d}:{s:02d}")
+
+    def _copy(self) -> None:
+        QGuiApplication.clipboard().setText(self.text.toPlainText())
+        self.statusMessage.emit("Live transcript copied")
+
+
 # --- Settings dialog ----------------------------------------------------
 
 class SettingsDialog(QDialog):
@@ -1848,6 +2135,17 @@ class MainWindow(QMainWindow):
         self.record_panel.statusMessage.connect(self.statusBar().showMessage)
         rec_layout.addWidget(self.record_panel)
         self.source_tabs.addTab(record_tab, "Record")
+
+        live_tab = QWidget()
+        live_layout = QVBoxLayout(live_tab)
+        live_layout.setContentsMargins(10, 12, 10, 10)
+        self.live_panel = LivePanel()
+        self.live_panel.chunkRecorded.connect(self._on_live_chunk_recorded)
+        self.live_panel.statusMessage.connect(self.statusBar().showMessage)
+        # Worker streams transcribed text back via live_chunk → panel.
+        self.worker.live_chunk.connect(self.live_panel.append_text)
+        live_layout.addWidget(self.live_panel)
+        self.source_tabs.addTab(live_tab, "Live")
 
         root.addWidget(self.source_tabs)
 
@@ -2206,6 +2504,29 @@ class MainWindow(QMainWindow):
         # on the Record tab so the user can keep recording back-to-back.
         self.set_files([path])
 
+    def _on_live_chunk_recorded(self, path: str) -> None:
+        # New audio chunk closed by ffmpeg's segment muxer — feed it
+        # to the worker for transcription. Skip if a regular file
+        # transcription is in flight to avoid stalling that pipeline.
+        if not self._current_model or not is_model_downloaded(self._current_model):
+            return
+        if self.worker.is_running() and not getattr(self, "_live_active_seen", False):
+            # Worker queue is busy with a non-live job. Skip this chunk
+            # rather than letting live commands pile up behind it.
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        self._live_active_seen = True
+        self.worker.transcribe_live(
+            path,
+            self._current_model,
+            self._cpu_threads,
+            self._language or None,
+            self._current_ram_cap_gb(),
+        )
+
     # --- transcription --------------------------------------------------
     def start_transcription(self) -> None:
         if not self._file_queue:
@@ -2517,6 +2838,10 @@ class MainWindow(QMainWindow):
         # Stop a recording in flight so we don't leak ffmpeg.
         try:
             self.record_panel.stop_if_recording()
+        except Exception:
+            pass
+        try:
+            self.live_panel.stop_if_recording()
         except Exception:
             pass
         # Tell the persistent worker to exit cleanly so the cached model
