@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -74,6 +75,20 @@ MODELS: list[tuple[str, int, float]] = [
     ("large-v3", 2900, 10.0),
     ("turbo", 1500, 6.0),
 ]
+
+# Heuristic seconds-of-CPU per second-of-audio at ~4 threads on a modern
+# x86 box. Used to drive a smooth time-based estimate of the transcription
+# progress bar — whisper itself only ticks tqdm at 30-second clip
+# boundaries, so on a single-clip recording the bar would otherwise stay
+# at 0% the whole time.
+MODEL_RT_FACTOR: dict[str, float] = {
+    "tiny": 0.15,
+    "base": 0.5,
+    "small": 1.5,
+    "medium": 3.5,
+    "large-v3": 7.0,
+    "turbo": 1.0,
+}
 
 AUDIO_EXTS = {
     ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".opus",
@@ -151,6 +166,21 @@ def available_ram_gb() -> float:
     if "MemAvailable" in info:
         return info["MemAvailable"] / 1024 / 1024
     return (info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)) / 1024 / 1024
+
+
+def audio_duration_seconds(path: str) -> float:
+    """Return the duration of `path` in seconds via ffprobe, or 0 on error."""
+    if not path or not shutil.which("ffprobe"):
+        return 0.0
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=5,
+        )
+        return float(result.stdout.strip() or 0)
+    except Exception:
+        return 0.0
 
 
 # --- Theme --------------------------------------------------------------
@@ -492,21 +522,29 @@ def _systemd_run_available() -> bool:
 
 
 class TranscribeProcess(QObject):
-    """Runs the transcription in an isolated subprocess.
+    """Persistent worker subprocess.
 
-    Why a process and not a thread:
-    - whisper.transcribe is a long C++/PyTorch call. Aborting it from the GUI
-      via QThread.terminate() leaves the runtime in a broken state and has
-      hung the app in practice. Killing a child process is clean.
-    - With ram_cap_gb > 0 we wrap in `systemd-run --user --scope` to enforce
-      a real cgroup memory limit (RLIMIT_AS does not work because PyTorch
-      reserves far more virtual address space than its actual RSS).
+    Spawned once and kept alive across transcriptions so the loaded
+    Whisper model stays in memory between files (preload + reuse).
+    Communicates via line-delimited JSON commands on stdin and
+    `[STATUS] ...` lines on stderr. Result of each transcribe is
+    written by the worker to a tempfile path supplied by the GUI.
+
+    Lifecycle:
+    - Worker is (re)spawned on first command, or whenever the RAM cap
+      changes (the cap is wired in via `systemd-run` so it cannot be
+      changed for an already-running process).
+    - Cancel terminates the worker — whisper.transcribe is not
+      interruptible from Python, so killing the process is the only
+      way to stop it. The cached model is lost; next call respawns.
+    - On normal app exit, send `quit` and let the worker exit cleanly.
     """
 
-    progress = pyqtSignal(str)
-    progress_pct = pyqtSignal(int)
-    finished_ok = pyqtSignal(dict)
-    failed = pyqtSignal(str)
+    progress = pyqtSignal(str)            # raw [STATUS] message
+    progress_pct = pyqtSignal(int)        # tqdm percentage
+    preload_done = pyqtSignal(str)        # model name once loaded
+    finished_ok = pyqtSignal(dict)        # transcription result
+    failed = pyqtSignal(str)              # transcription failed
 
     # tqdm overwrites a single line with carriage returns:
     # "  0%|          | 0/2669 [00:00<?, ?frames/s]"
@@ -516,8 +554,6 @@ class TranscribeProcess(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.proc = QProcess(self)
-        # Force unbuffered Python in the worker so tqdm progress lines
-        # arrive promptly instead of being held in stdio buffers.
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUNBUFFERED", "1")
         self.proc.setProcessEnvironment(env)
@@ -527,9 +563,25 @@ class TranscribeProcess(QObject):
         self._stderr_buf = ""
         self._stderr_log: list[str] = []
         self._cancelled = False
-        self._result_path: str | None = None
+        self._active_result_path: str | None = None
+        self._spawned_ram_cap_gb: int = -1   # -1 = nothing spawned yet
+        self._loaded_model: str | None = None
 
-    def start(
+    # --- public API -----------------------------------------------------
+    def preload(self, model: str, cpu_threads: int, ram_cap_gb: int = 0) -> None:
+        """Ask the worker to load `model` in the background. No-op if
+        already loaded with the same cap."""
+        self._ensure_running(ram_cap_gb)
+        if self._loaded_model == model:
+            self.preload_done.emit(model)
+            return
+        self._send({
+            "action": "preload",
+            "model": model,
+            "cpu_threads": int(cpu_threads),
+        })
+
+    def transcribe(
         self,
         file_path: str,
         model: str,
@@ -537,26 +589,69 @@ class TranscribeProcess(QObject):
         language: str | None,
         ram_cap_gb: int = 0,
     ) -> None:
-        self._stderr_buf = ""
-        self._stderr_log.clear()
-        self._cancelled = False
-
+        self._ensure_running(ram_cap_gb)
         # Result is written to a tempfile by the worker, not piped via
         # stdout — pipes can race or be polluted by stray torch/tqdm output.
-        fd, self._result_path = tempfile.mkstemp(prefix="whisper-result-", suffix=".json")
+        fd, path = tempfile.mkstemp(prefix="whisper-result-", suffix=".json")
         os.close(fd)
-
-        cfg = json.dumps({
-            "file": file_path,
+        self._active_result_path = path
+        self._cancelled = False
+        self._send({
+            "action": "transcribe",
             "model": model,
-            "cpu_threads": cpu_threads,
+            "cpu_threads": int(cpu_threads),
+            "file": file_path,
             "language": language or "",
-            "result_path": self._result_path,
+            "result_path": path,
         })
+
+    def cancel(self) -> None:
+        if self.proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._cancelled = True
+        self.proc.terminate()
+        if not self.proc.waitForFinished(2000):
+            self.proc.kill()
+            self.proc.waitForFinished(2000)
+
+    def quit_worker(self) -> None:
+        """Best-effort clean shutdown. Used on app close."""
+        if self.proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        try:
+            self._send({"action": "quit"})
+            self.proc.closeWriteChannel()
+            if not self.proc.waitForFinished(1500):
+                self.proc.kill()
+        except Exception:
+            self.proc.kill()
+
+    def is_running(self) -> bool:
+        return self._active_result_path is not None
+
+    # --- internals ------------------------------------------------------
+    def _send(self, cmd: dict) -> None:
+        if self.proc.state() == QProcess.ProcessState.NotRunning:
+            self.failed.emit("Worker is not running.")
+            return
+        line = (json.dumps(cmd) + "\n").encode("utf-8")
+        self.proc.write(line)
+
+    def _ensure_running(self, ram_cap_gb: int) -> None:
+        running = self.proc.state() != QProcess.ProcessState.NotRunning
+        if running and ram_cap_gb == self._spawned_ram_cap_gb:
+            return
+        # Different cap or not yet started — (re)spawn.
+        if running:
+            self.quit_worker()
+        self._stderr_buf = ""
+        self._stderr_log.clear()
+        self._loaded_model = None
+        self._active_result_path = None
+        self._cancelled = False
 
         py = sys.executable or "python3"
         worker_args = [str(WORKER_SCRIPT)]
-
         if ram_cap_gb > 0 and _systemd_run_available():
             program = "systemd-run"
             args = [
@@ -568,29 +663,14 @@ class TranscribeProcess(QObject):
         else:
             program = py
             args = worker_args
-
         self.proc.setProgram(program)
         self.proc.setArguments(args)
         self.proc.start()
         if not self.proc.waitForStarted(5000):
             self.failed.emit(f"Failed to start worker: {self.proc.errorString()}")
             return
-        self.proc.write(cfg.encode("utf-8"))
-        self.proc.closeWriteChannel()
+        self._spawned_ram_cap_gb = ram_cap_gb
 
-    def cancel(self) -> None:
-        if self.proc.state() == QProcess.ProcessState.NotRunning:
-            return
-        self._cancelled = True
-        self.proc.terminate()
-        if not self.proc.waitForFinished(2000):
-            self.proc.kill()
-            self.proc.waitForFinished(2000)
-
-    def is_running(self) -> bool:
-        return self.proc.state() != QProcess.ProcessState.NotRunning
-
-    # --- internals ------------------------------------------------------
     def _on_stderr(self) -> None:
         data = bytes(self.proc.readAllStandardError()).decode("utf-8", errors="replace")
         self._stderr_buf += data
@@ -613,7 +693,7 @@ class TranscribeProcess(QObject):
             if not line:
                 continue
             if line.startswith("[STATUS] "):
-                self.progress.emit(line[len("[STATUS] "):])
+                self._handle_status(line[len("[STATUS] "):])
                 continue
             m = self._TQDM_RE.match(line)
             if m:
@@ -621,8 +701,54 @@ class TranscribeProcess(QObject):
                 continue
             self._stderr_log.append(line)
 
+    def _handle_status(self, msg: str) -> None:
+        # Surface to the GUI for the status bar / progress label.
+        self.progress.emit(msg)
+        # Track loaded-model state.
+        low = msg.lower()
+        if low.startswith("model ") and "loaded" in low:
+            # "Model <name> loaded"
+            parts = msg.split()
+            if len(parts) >= 2:
+                self._loaded_model = parts[1]
+        if msg == "Ready":
+            if self._loaded_model:
+                self.preload_done.emit(self._loaded_model)
+        elif msg == "Done":
+            self._deliver_result()
+        elif msg.startswith("ERROR:"):
+            err = msg[len("ERROR:"):].strip()
+            tail = "\n".join(self._stderr_log[-15:]).strip()
+            self.failed.emit(f"{err}\n\n{tail}" if tail else err)
+            # Cleanup any pending result file.
+            if self._active_result_path:
+                try:
+                    Path(self._active_result_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self._active_result_path = None
+
+    def _deliver_result(self) -> None:
+        path = self._active_result_path
+        self._active_result_path = None
+        if not path:
+            return
+        try:
+            if not Path(path).exists():
+                raise FileNotFoundError("worker did not write the result file")
+            with open(path, "r", encoding="utf-8") as f:
+                result = json.load(f)
+            self.finished_ok.emit(result)
+        except Exception as e:
+            tail = "\n".join(self._stderr_log[-15:]).strip()
+            self.failed.emit(f"Failed to read worker result: {e}\n\n{tail}")
+        finally:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def _on_error(self, _err) -> None:
-        # QProcess error — actual handling happens in _on_finished.
         pass
 
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
@@ -631,43 +757,49 @@ class TranscribeProcess(QObject):
         if self._stderr_buf.strip():
             self._stderr_log.append(self._stderr_buf.strip())
             self._stderr_buf = ""
+        # Mark cap state as unspawned so the next call respawns.
+        self._spawned_ram_cap_gb = -1
+        self._loaded_model = None
 
-        result_path = self._result_path
-        self._result_path = None
+        path = self._active_result_path
+        self._active_result_path = None
 
-        try:
-            if self._cancelled:
-                self.failed.emit("Cancelled.")
-                return
+        if self._cancelled:
+            if path:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self.failed.emit("Cancelled.")
+            return
 
-            if exit_status == QProcess.ExitStatus.CrashExit or exit_code != 0:
-                tail = "\n".join(self._stderr_log[-30:]).strip()
+        if path is None:
+            # No transcription was in flight — worker just exited (e.g.
+            # user closed the app, or model-load crashed during preload).
+            if exit_status == QProcess.ExitStatus.CrashExit or exit_code not in (0, 9, 137):
+                tail = "\n".join(self._stderr_log[-15:]).strip()
                 hint = ""
-                # systemd-run kills via signal when MemoryMax is hit.
                 if exit_code in (137, 9):
                     hint = "\n\nThe process was killed (likely OOM under the RAM cap)."
-                elif exit_status == QProcess.ExitStatus.CrashExit:
-                    hint = "\n\nThe worker crashed."
                 self.failed.emit(
                     f"Worker exited (code {exit_code}).{hint}\n\n{tail or '(no stderr output)'}"
                 )
-                return
+            return
 
-            try:
-                if not result_path or not Path(result_path).exists():
-                    raise FileNotFoundError("worker did not write the result file")
-                with open(result_path, "r", encoding="utf-8") as f:
-                    result = json.load(f)
-                self.finished_ok.emit(result)
-            except Exception as e:
-                tail = "\n".join(self._stderr_log[-30:]).strip()
-                self.failed.emit(f"Failed to read worker result: {e}\n\n{tail}")
-        finally:
-            if result_path:
-                try:
-                    Path(result_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
+        # A transcription was in flight when the worker died.
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        tail = "\n".join(self._stderr_log[-15:]).strip()
+        hint = ""
+        if exit_code in (137, 9):
+            hint = "\n\nThe process was killed (likely OOM under the RAM cap)."
+        elif exit_status == QProcess.ExitStatus.CrashExit:
+            hint = "\n\nThe worker crashed."
+        self.failed.emit(
+            f"Worker exited (code {exit_code}).{hint}\n\n{tail or '(no stderr output)'}"
+        )
 
 
 class DownloadWorker(QThread):
@@ -988,6 +1120,12 @@ class MainWindow(QMainWindow):
         self.worker.progress_pct.connect(self._on_worker_progress_pct)
         self.worker.finished_ok.connect(self.on_transcribe_done)
         self.worker.failed.connect(self.on_transcribe_failed)
+        self.worker.preload_done.connect(self._on_preload_done)
+        self._estimate_timer = QTimer(self)
+        self._estimate_timer.setInterval(200)
+        self._estimate_timer.timeout.connect(self._tick_progress_estimate)
+        self._estimate_total = 0.0
+        self._estimate_started = 0.0
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1191,10 +1329,21 @@ class MainWindow(QMainWindow):
         if self._current_model:
             self._update_model_warning(self._current_model)
 
-    def _set_current_model(self, name: str) -> None:
+    def _set_current_model(self, name: str, *, preload: bool = True) -> None:
         self._current_model = name
         self._update_model_button()
         self._update_model_warning(name)
+        # Kick off a background load so the next Start has the model
+        # already in RAM. Skipped only when explicitly disabled (e.g.
+        # initial selection during boot before the worker is wired).
+        if preload and is_model_downloaded(name) and not self.worker.is_running():
+            ram_cap_gb = self._current_ram_cap_gb()
+            self.worker.preload(name, self.cpu_spin.value(), ram_cap_gb)
+
+    def _current_ram_cap_gb(self) -> int:
+        if self.ram_cap_check.isChecked() and _systemd_run_available():
+            return self.ram_cap_spin.value()
+        return 0
 
     def _update_model_button(self) -> None:
         name = self._current_model
@@ -1203,13 +1352,19 @@ class MainWindow(QMainWindow):
             return
         ram = next((r for n, _, r in MODELS if n == name), 0.0)
         if is_model_downloaded(name):
-            status = "✓ downloaded"
+            loaded_marker = "  · loaded" if self.worker._loaded_model == name else ""
+            status = "✓ downloaded" + loaded_marker
             tail = f"~{ram:.0f} GB RAM"
         else:
             dl = next((d for n, d, _ in MODELS if n == name), 0)
             status = "not downloaded"
             tail = f"~{dl} MB to fetch · ~{ram:.0f} GB RAM"
         self.model_btn.setText(f"  Model:  {name}    {status}    ·    {tail}")
+
+    def _on_preload_done(self, name: str) -> None:
+        if name == self._current_model:
+            self.statusBar().showMessage(f"Model {name} ready")
+            self._update_model_button()
 
     def open_model_picker(self) -> None:
         dlg = ModelPickerDialog(self._current_model, self)
@@ -1239,11 +1394,15 @@ class MainWindow(QMainWindow):
 
     # --- file selection -------------------------------------------------
     def pick_file(self) -> None:
+        last_folder = self.settings.get("last_folder")
+        start_dir = last_folder if last_folder and Path(last_folder).is_dir() else str(Path.home())
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select audio or video file", str(Path.home()),
+            self, "Select audio or video file", start_dir,
             "Media (*.wav *.mp3 *.m4a *.flac *.ogg *.opus *.mp4 *.mkv *.webm *.mov *.avi);;All files (*)",
         )
         if path:
+            self.settings["last_folder"] = str(Path(path).parent)
+            save_settings(self.settings)
             self.set_file(path)
 
     def set_file(self, path: str) -> None:
@@ -1262,6 +1421,8 @@ class MainWindow(QMainWindow):
         self.file_edit.setText(self.current_file)
         self.drop.setText(p.name)
         self.drop.setHasFile(True)
+        self.settings["last_folder"] = str(p.parent)
+        save_settings(self.settings)
 
     # --- transcription --------------------------------------------------
     def start_transcription(self) -> None:
@@ -1317,7 +1478,7 @@ class MainWindow(QMainWindow):
         self.copy_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
 
-        self.worker.start(self.current_file, model_name, cpu_threads, language, ram_cap_gb)
+        self.worker.transcribe(self.current_file, model_name, cpu_threads, language, ram_cap_gb)
 
     def _on_worker_progress(self, msg: str) -> None:
         # Status bar mirrors phase, the progress bar shows it inline so
@@ -1325,14 +1486,46 @@ class MainWindow(QMainWindow):
         # hasn't ticked tqdm yet (short clips, model download, etc.).
         self.statusBar().showMessage(msg)
         self._progress_phase = msg
+        # Reset bar at the start of each new phase. The transcribe
+        # phase additionally kicks off a time-based estimator that
+        # smoothly fills 0→99% while whisper churns on its single clip.
         self.progress.setValue(0)
         self.progress.setFormat(f"{msg}    0%")
+        if msg.startswith("Transcribing"):
+            self._start_progress_estimate()
+        else:
+            self._estimate_timer.stop()
 
     def _on_worker_progress_pct(self, pct: int) -> None:
         pct = max(0, min(100, pct))
-        self.progress.setValue(pct)
+        # Real tqdm number wins if it's ahead of the time-based estimate.
+        if pct > self.progress.value():
+            self.progress.setValue(pct)
         phase = getattr(self, "_progress_phase", "")
         self.progress.setFormat(f"{phase}    %p%" if phase else "%p%")
+
+    def _start_progress_estimate(self) -> None:
+        duration = audio_duration_seconds(self.current_file or "")
+        factor = MODEL_RT_FACTOR.get(
+            (self._current_model or "").replace(".en", ""), 1.0
+        )
+        # Threads cut wall-clock roughly with sqrt(threads) before plateau.
+        threads = max(1, self.cpu_spin.value())
+        speedup = max(1.0, min(threads, 6) ** 0.6)
+        self._estimate_total = max(2.0, duration * factor / speedup)
+        self._estimate_started = time.monotonic()
+        self._estimate_timer.start()
+
+    def _tick_progress_estimate(self) -> None:
+        if not self.worker.is_running():
+            self._estimate_timer.stop()
+            return
+        elapsed = time.monotonic() - self._estimate_started
+        pct = int(min(99, 100 * elapsed / max(0.5, self._estimate_total)))
+        if pct > self.progress.value():
+            self.progress.setValue(pct)
+            phase = getattr(self, "_progress_phase", "")
+            self.progress.setFormat(f"{phase}    %p%" if phase else "%p%")
 
     def cancel_transcription(self) -> None:
         if self.worker.is_running():
@@ -1356,6 +1549,7 @@ class MainWindow(QMainWindow):
             self.progress.setFormat("Starting…    0%")
             self.model_warning.setVisible(False)
         else:
+            self._estimate_timer.stop()
             self.progress.setValue(0)
             self.progress.setFormat("Idle")
             self.model_warning.setVisible(bool(self.model_warning.text()))
@@ -1446,6 +1640,12 @@ class MainWindow(QMainWindow):
         # Remember last window size so the next launch comes up the same way.
         self.settings["window_size"] = [self.width(), self.height()]
         save_settings(self.settings)
+        # Tell the persistent worker to exit cleanly so the cached model
+        # doesn't stay resident if the user just closed the window.
+        try:
+            self.worker.quit_worker()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 

@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Whisper transcription worker.
+"""Whisper transcription worker — long-running command loop.
 
-Spawned by the main GUI as an isolated subprocess so that:
-- Cancel can simply kill this process — the GUI never blocks on torch.
-- A hard RAM cap can be applied by wrapping us in
-  `systemd-run --user --scope -p MemoryMax=NG -p MemorySwapMax=0 -- python3 ...`.
+Runs as a child process of the GUI. Keeps the loaded model in memory
+between transcriptions so consecutive files do not pay the model-load
+cost over and over (which was 5–30 s each on CPU for the larger
+models).
 
 Protocol:
-  stdin  : single JSON object — {file, model, cpu_threads, language?, result_path}
-  stderr : human progress, one per line, prefixed `[STATUS] `
-  result : written as JSON to `result_path` (NOT stdout — too easy for
-           torch / whisper / tqdm to pollute stdout in a child process).
-  exit 0 : success, result_path is readable
-  exit 1 : failure, stderr contains traceback
+  stdin  : one JSON object per line, each is a command. Commands:
+             {"action": "preload", "model": "...", "cpu_threads": N}
+                 — load the model and answer with `[STATUS] Ready`.
+             {"action": "transcribe", "model": "...", "cpu_threads": N,
+              "file": "/path", "language": "en", "result_path": "/path"}
+                 — load the model if it differs from the cached one,
+                   transcribe, write JSON to result_path, answer with
+                   `[STATUS] Done`.
+             {"action": "quit"}
+                 — exit cleanly.
+  stderr : human progress lines, prefixed `[STATUS] `, plus tqdm output.
+  stdout : not used. Stays redirected to stderr at startup so any stray
+           print from torch / whisper cannot pollute the channel.
 """
 from __future__ import annotations
 
@@ -28,44 +35,80 @@ def emit(msg: str) -> None:
 
 
 def main() -> int:
-    raw = sys.stdin.read()
-    if not raw.strip():
-        emit("ERROR: empty config on stdin")
-        return 2
-    cfg = json.loads(raw)
-
-    result_path = cfg.get("result_path")
-    if not result_path:
-        emit("ERROR: missing result_path in config")
-        return 2
-
     # Belt & braces: redirect stdout to stderr so any stray print from
     # torch / whisper / tqdm cannot mix into the parent's stdout pipe.
     sys.stdout = sys.stderr
 
-    cpu = max(1, int(cfg.get("cpu_threads", 1)))
-    os.environ["OMP_NUM_THREADS"] = str(cpu)
-    os.environ["MKL_NUM_THREADS"] = str(cpu)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(cpu)
+    model = None
+    current_model_name: str | None = None
+    current_cpu_threads: int = 0
 
-    emit(f"Loading model {cfg['model']}…")
-    import torch
-    torch.set_num_threads(cpu)
-    import whisper
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            cmd = json.loads(line)
+        except json.JSONDecodeError as e:
+            emit(f"ERROR: malformed command — {e}")
+            continue
 
-    model = whisper.load_model(cfg["model"], device="cpu")
+        action = cmd.get("action")
+        if action == "quit":
+            emit("Bye")
+            return 0
 
-    emit("Transcribing… (this may take a while)")
-    result = model.transcribe(
-        cfg["file"],
-        language=cfg.get("language") or None,
-        fp16=False,
-        verbose=False,
-    )
+        if action not in ("preload", "transcribe"):
+            emit(f"ERROR: unknown action {action!r}")
+            continue
 
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False)
-    emit("Done")
+        try:
+            cpu = max(1, int(cmd.get("cpu_threads", 1)))
+            if cpu != current_cpu_threads:
+                os.environ["OMP_NUM_THREADS"] = str(cpu)
+                os.environ["MKL_NUM_THREADS"] = str(cpu)
+                os.environ["OPENBLAS_NUM_THREADS"] = str(cpu)
+                current_cpu_threads = cpu
+
+            target_model = cmd.get("model")
+            if not target_model:
+                emit("ERROR: missing model")
+                continue
+
+            if target_model != current_model_name:
+                emit(f"Loading model {target_model}…")
+                import torch
+                torch.set_num_threads(cpu)
+                import whisper
+                model = whisper.load_model(target_model, device="cpu")
+                current_model_name = target_model
+                emit(f"Model {target_model} loaded")
+
+            if action == "preload":
+                emit("Ready")
+                continue
+
+            # action == "transcribe"
+            file_path = cmd.get("file")
+            result_path = cmd.get("result_path")
+            if not file_path or not result_path:
+                emit("ERROR: transcribe needs file and result_path")
+                continue
+
+            emit("Transcribing… (this may take a while)")
+            result = model.transcribe(
+                file_path,
+                language=cmd.get("language") or None,
+                fp16=False,
+                verbose=False,
+            )
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False)
+            emit("Done")
+        except Exception as e:
+            emit(f"ERROR: {e}")
+            traceback.print_exc(file=sys.stderr)
+
     return 0
 
 
