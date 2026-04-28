@@ -1987,6 +1987,12 @@ class MainWindow(QMainWindow):
         btn.setFixedSize(18, 18)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setToolTip("Close tab")
+        # Visual nudge: 5 px up and 5 px left from where the tab bar
+        # naturally places it.
+        btn.setStyleSheet(
+            "QToolButton#TabClose { margin: -5px 5px 0 0; "
+            "background: transparent; border: none; padding: 0; }"
+        )
         # Brighten the icon on hover.
         btn.installEventFilter(self)
         # Look up the tab by widget on click — index can shift if other
