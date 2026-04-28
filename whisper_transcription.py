@@ -995,19 +995,30 @@ class MainWindow(QMainWindow):
 
         # Hard RAM cap (systemd-run --user --scope -p MemoryMax=NG).
         # One full-width row so the checkbox + spin always fits — no second
-        # form-label column to compete for horizontal space.
+        # form-label column to compete for horizontal space. A live hint
+        # row below explains in plain language what the toggle actually
+        # does in the current state.
         ram_total_int = max(1, int(total_ram_gb()))
         ram_row = QHBoxLayout()
         ram_row.setContentsMargins(0, 0, 0, 0)
         ram_row.setSpacing(8)
         self.ram_cap_check = QCheckBox(f"Hard RAM cap (max {ram_total_int} GB)")
-        self.ram_cap_check.setToolTip(
-            "Wraps the worker in `systemd-run --user --scope -p MemoryMax=NG "
-            "-p MemorySwapMax=0`. The kernel OOM-kills the worker if exceeded."
+        cap_tip = (
+            "Run the transcription worker inside a systemd cgroup with a "
+            "memory ceiling. If it tries to use more than the cap, the "
+            "kernel kills the worker process (the GUI shows an OOM error) "
+            "instead of letting it swap or eat the whole machine.\n\n"
+            "Use it when running heavy models you don't want monopolising "
+            "RAM. Don't use it casually — picking a cap below the model's "
+            "actual need (e.g. cap=4 GB with large-v3) just causes an OOM "
+            "right after model load."
         )
+        self.ram_cap_check.setToolTip(cap_tip)
         if not _systemd_run_available():
             self.ram_cap_check.setEnabled(False)
-            self.ram_cap_check.setToolTip("systemd-run not found")
+            self.ram_cap_check.setToolTip(
+                "systemd-run not found on PATH — hard cap unavailable."
+            )
         self.ram_cap_check.setChecked(bool(self.settings.get("ram_cap_enabled", False)))
         self.ram_cap_spin = QSpinBox()
         self.ram_cap_spin.setRange(1, ram_total_int)
@@ -1016,7 +1027,7 @@ class MainWindow(QMainWindow):
         self.ram_cap_spin.setFixedWidth(140)
         self.ram_cap_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.ram_cap_spin.setEnabled(self.ram_cap_check.isChecked())
-        self.ram_cap_spin.setToolTip("Killed by the kernel if exceeded")
+        self.ram_cap_spin.setToolTip(cap_tip)
         self.ram_cap_check.toggled.connect(self.ram_cap_spin.setEnabled)
         ram_row.addWidget(self.ram_cap_check)
         ram_row.addWidget(self.ram_cap_spin)
@@ -1024,6 +1035,15 @@ class MainWindow(QMainWindow):
         ram_widget = QWidget()
         ram_widget.setLayout(ram_row)
         form.addRow(ram_widget)
+
+        self.ram_cap_hint = QLabel()
+        self.ram_cap_hint.setProperty("role", "muted")
+        self.ram_cap_hint.setWordWrap(True)
+        self.ram_cap_hint.setContentsMargins(0, 0, 0, 0)
+        self.ram_cap_check.toggled.connect(self._refresh_ram_cap_hint)
+        self.ram_cap_spin.valueChanged.connect(lambda _v: self._refresh_ram_cap_hint())
+        form.addRow(self.ram_cap_hint)
+        self._refresh_ram_cap_hint()
 
         self.lang_edit = QLineEdit()
         self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
@@ -1110,6 +1130,26 @@ class MainWindow(QMainWindow):
         )
         if self._current_model:
             self._update_model_warning(self._current_model)
+
+    def _refresh_ram_cap_hint(self) -> None:
+        if not _systemd_run_available():
+            self.ram_cap_hint.setText(
+                "systemd-run not available — hard cap can't be applied."
+            )
+            return
+        if self.ram_cap_check.isChecked():
+            cap = self.ram_cap_spin.value()
+            self.ram_cap_hint.setText(
+                f"On — kernel will kill the worker if it allocates more "
+                f"than {cap} GB. Useful to keep heavy models from "
+                f"monopolising RAM. Picking less than the model needs "
+                f"causes an OOM right after model load."
+            )
+        else:
+            self.ram_cap_hint.setText(
+                "Off — worker may use as much RAM as available. "
+                "Tick to make the kernel kill it past a chosen budget."
+            )
 
     def _set_current_model(self, name: str) -> None:
         self._current_model = name
