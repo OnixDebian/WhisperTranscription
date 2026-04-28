@@ -549,7 +549,11 @@ def build_stylesheet(t: dict) -> str:
         background-color: {bg};
         top: 0;
     }}
-    QTabBar {{ background-color: {bg}; border: none; }}
+    QTabBar {{
+        background-color: {bg};
+        border: none;
+        qproperty-drawBase: 0;
+    }}
     QTabBar::tab {{
         background: transparent;
         color: {muted};
@@ -564,6 +568,9 @@ def build_stylesheet(t: dict) -> str:
         background: {surface_hi};
         color: {accent};
     }}
+    /* QTextEdit inside a tab loses its 1 px border — otherwise it
+       paints a horizontal line that pokes out next to the tab pill. */
+    QTabWidget QTextEdit {{ border: none; }}
 
     /* Segmented control: two/three pill-buttons sharing borders */
     QPushButton#SegmentBtn {{
