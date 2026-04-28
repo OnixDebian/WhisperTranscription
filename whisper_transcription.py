@@ -1614,6 +1614,25 @@ class LivePanel(QWidget):
         src_row.addStretch(1)
         layout.addLayout(src_row)
 
+        # Language hint — if set, whisper skips its own language
+        # detection step on every chunk, which is a measurable speed-up
+        # for live mode (chunks are short so the language probe is a
+        # noticeable fraction of decode time).
+        lang_row = QHBoxLayout()
+        lang_lbl = QLabel("Language:")
+        lang_lbl.setMinimumWidth(70)
+        lang_row.addWidget(lang_lbl)
+        self.lang_edit = QLineEdit()
+        self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
+        self.lang_edit.setToolTip(
+            "Set a language code (en, ru, de…) to skip Whisper's "
+            "per-chunk language detection. Faster on live mode."
+        )
+        self.lang_edit.setMaximumWidth(280)
+        lang_row.addWidget(self.lang_edit)
+        lang_row.addStretch(1)
+        layout.addLayout(lang_row)
+
         # Big Start / Stop button (toggle).
         self.toggle_btn = QPushButton()
         self.toggle_btn.setObjectName("RecordButton")
@@ -1660,6 +1679,15 @@ class LivePanel(QWidget):
     def stop_if_recording(self) -> None:
         if self.is_recording():
             self._stop()
+
+    def language_hint(self) -> str:
+        return self.lang_edit.text().strip()
+
+    def set_default_language(self, lang: str) -> None:
+        # Used by MainWindow on startup to seed the field from the
+        # global setting if the user hasn't overridden it locally.
+        if not self.lang_edit.text().strip():
+            self.lang_edit.setText(lang or "")
 
     def append_text(self, chunk: str) -> None:
         chunk = chunk.strip()
@@ -2071,7 +2099,7 @@ class MainWindow(QMainWindow):
         else:
             # New-install default — main window is small now that the
             # picker and resources moved to Settings.
-            self.resize(610, 605)
+            self.resize(610, 790)
         self.current_file: str | None = None
         self._file_queue: list[str] = []
         self._batch_index: int = 0
@@ -2140,6 +2168,7 @@ class MainWindow(QMainWindow):
         live_layout = QVBoxLayout(live_tab)
         live_layout.setContentsMargins(10, 12, 10, 10)
         self.live_panel = LivePanel()
+        self.live_panel.set_default_language(self.settings.get("language", ""))
         self.live_panel.chunkRecorded.connect(self._on_live_chunk_recorded)
         self.live_panel.statusMessage.connect(self.statusBar().showMessage)
         # Worker streams transcribed text back via live_chunk → panel.
@@ -2519,11 +2548,15 @@ class MainWindow(QMainWindow):
                 pass
             return
         self._live_active_seen = True
+        # Live tab has its own language hint; fall back to the global
+        # one. Setting a language is a noticeable speed-up because
+        # whisper skips the auto-detect step for each chunk.
+        lang = self.live_panel.language_hint() or self._language or None
         self.worker.transcribe_live(
             path,
             self._current_model,
             self._cpu_threads,
-            self._language or None,
+            lang,
             self._current_ram_cap_gb(),
         )
 
