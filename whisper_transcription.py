@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -489,6 +490,56 @@ def build_stylesheet(t: dict) -> str:
     DropLabel[hasFile="true"] {{
         border-color: {accent};
         color: {fg};
+    }}
+
+    /* Tabs at the top of the main window (File / Record) */
+    QTabWidget::pane {{
+        border: 1px solid {border};
+        border-radius: 8px;
+        top: -1px;
+    }}
+    QTabBar::tab {{
+        background: transparent;
+        color: {muted};
+        padding: 8px 18px;
+        border: 1px solid transparent;
+        border-bottom: none;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        margin-right: 2px;
+        font-weight: 600;
+    }}
+    QTabBar::tab:hover {{ color: {fg}; }}
+    QTabBar::tab:selected {{
+        background: {bg};
+        color: {accent};
+        border: 1px solid {border};
+        border-bottom: 1px solid {bg};
+    }}
+
+    /* Big record button with red recording state */
+    QPushButton#RecordButton {{
+        background: {surface};
+        color: {fg};
+        border: 2px solid {border};
+        border-radius: 12px;
+        font-size: 13pt;
+        font-weight: 700;
+        padding: 12px 18px;
+    }}
+    QPushButton#RecordButton:hover {{
+        background: {surface_hi};
+        border-color: {accent};
+    }}
+    QPushButton#RecordButton[recording="true"] {{
+        background: {danger};
+        color: {on_accent};
+        border-color: {danger};
+    }}
+    QPushButton#RecordButton[recording="true"]:hover {{
+        background: {fg};
+        color: {bg};
+        border-color: {fg};
     }}
 
     /* Model chooser button: full-width, button-card styled */
@@ -959,6 +1010,217 @@ class ModelPicker(QWidget):
             card.refresh_status()
 
 
+class RecordPanel(QWidget):
+    """Live recording into a temp WAV via ffmpeg + PulseAudio.
+
+    Two modes:
+    - Click to start / Click to stop  (default — toggle on click)
+    - Push and hold                   (record only while button is held)
+
+    Two sources:
+    - Microphone (PulseAudio default source)
+    - System audio (default sink's monitor — captures whatever is playing)
+
+    On stop, emits `fileRecorded(path)` with the WAV path so the main
+    window can drop it into the same pipeline as a picked file.
+    """
+
+    fileRecorded = pyqtSignal(str)
+    statusMessage = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._proc: QProcess | None = None
+        self._record_path: str | None = None
+        self._record_started_at: float = 0.0
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(200)
+        self._tick_timer.timeout.connect(self._update_duration)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        # Source picker
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("Source:"))
+        self.src_mic = QRadioButton("Microphone")
+        self.src_sys = QRadioButton("System audio")
+        self.src_mic.setChecked(True)
+        src_group = QButtonGroup(self)
+        src_group.addButton(self.src_mic)
+        src_group.addButton(self.src_sys)
+        src_row.addWidget(self.src_mic)
+        src_row.addWidget(self.src_sys)
+        src_row.addStretch(1)
+        layout.addLayout(src_row)
+
+        # Mode picker
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Trigger:"))
+        self.mode_click = QRadioButton("Click to start / stop")
+        self.mode_push = QRadioButton("Push and hold")
+        self.mode_click.setChecked(True)
+        mode_group = QButtonGroup(self)
+        mode_group.addButton(self.mode_click)
+        mode_group.addButton(self.mode_push)
+        mode_row.addWidget(self.mode_click)
+        mode_row.addWidget(self.mode_push)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        # Big record button
+        self.record_btn = QPushButton()
+        self.record_btn.setObjectName("RecordButton")
+        self.record_btn.setMinimumHeight(64)
+        self.record_btn.setProperty("recording", "false")
+        self.record_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.record_btn.clicked.connect(self._on_clicked)
+        self.record_btn.pressed.connect(self._on_pressed)
+        self.record_btn.released.connect(self._on_released)
+        layout.addWidget(self.record_btn)
+
+        self.duration_lbl = QLabel("")
+        self.duration_lbl.setProperty("role", "muted")
+        self.duration_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.duration_lbl)
+
+        if not shutil.which("ffmpeg"):
+            self.record_btn.setEnabled(False)
+            self.record_btn.setToolTip("ffmpeg not found — recording disabled")
+        elif not shutil.which("pactl"):
+            self.record_btn.setToolTip(
+                "pactl not found — recording will use the default Pulse source"
+            )
+
+        self.mode_click.toggled.connect(lambda _: self._refresh_button_text())
+        self.mode_push.toggled.connect(lambda _: self._refresh_button_text())
+        self._refresh_button_text()
+
+    # --- public ---------------------------------------------------------
+    def is_recording(self) -> bool:
+        return self._proc is not None and self._proc.state() != QProcess.ProcessState.NotRunning
+
+    def stop_if_recording(self) -> None:
+        if self.is_recording():
+            self._stop_recording()
+
+    # --- handlers -------------------------------------------------------
+    def _on_clicked(self) -> None:
+        # `clicked` fires after `released`; in push-and-hold mode the
+        # release already stopped the recording — ignore.
+        if self.mode_push.isChecked():
+            return
+        if self.is_recording():
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _on_pressed(self) -> None:
+        if self.mode_push.isChecked() and not self.is_recording():
+            self._start_recording()
+
+    def _on_released(self) -> None:
+        if self.mode_push.isChecked() and self.is_recording():
+            self._stop_recording()
+
+    # --- recording ------------------------------------------------------
+    def _resolve_source(self) -> str:
+        if self.src_mic.isChecked():
+            return "default"
+        # System audio: ask pactl for the default sink and use its monitor.
+        if shutil.which("pactl"):
+            try:
+                out = subprocess.run(
+                    ["pactl", "info"], capture_output=True, text=True, timeout=2,
+                ).stdout
+                for line in out.splitlines():
+                    if line.startswith("Default Sink:"):
+                        sink = line.split(":", 1)[1].strip()
+                        if sink:
+                            return f"{sink}.monitor"
+            except Exception:
+                pass
+        return "default"  # best-effort fallback
+
+    def _start_recording(self) -> None:
+        source = self._resolve_source()
+        path = str(RUNTIME_DIR / f"recording-{int(time.time())}.wav")
+        self._record_path = path
+
+        self._proc = QProcess(self)
+        self._proc.setProgram("ffmpeg")
+        self._proc.setArguments([
+            "-loglevel", "error",
+            "-f", "pulse", "-i", source,
+            "-ar", "16000", "-ac", "1",
+            "-y", path,
+        ])
+        self._proc.finished.connect(self._on_proc_finished)
+        self._proc.start()
+        if not self._proc.waitForStarted(3000):
+            err = self._proc.errorString()
+            self._proc = None
+            self._record_path = None
+            self.statusMessage.emit(f"Recording failed to start: {err}")
+            return
+        self._record_started_at = time.monotonic()
+        self._tick_timer.start()
+        self._refresh_button_text()
+        self.statusMessage.emit(
+            f"Recording from {'microphone' if self.src_mic.isChecked() else 'system audio'}…"
+        )
+
+    def _stop_recording(self) -> None:
+        if not self._proc:
+            return
+        # ffmpeg quits cleanly on 'q' on stdin and writes a valid file;
+        # SIGTERM also works but may truncate.
+        try:
+            self._proc.write(b"q\n")
+            self._proc.closeWriteChannel()
+        except Exception:
+            self._proc.terminate()
+        if not self._proc.waitForFinished(3000):
+            self._proc.kill()
+            self._proc.waitForFinished(1000)
+
+    def _on_proc_finished(self, _exit_code, _exit_status) -> None:
+        self._tick_timer.stop()
+        path = self._record_path
+        self._record_path = None
+        proc = self._proc
+        self._proc = None
+        self._refresh_button_text()
+        if not path or not Path(path).exists() or Path(path).stat().st_size < 1024:
+            self.statusMessage.emit("Recording produced no audio.")
+            return
+        secs = time.monotonic() - self._record_started_at
+        self.duration_lbl.setText(f"Recorded {secs:.1f} s → {Path(path).name}")
+        self.fileRecorded.emit(path)
+        self.statusMessage.emit(f"Recorded {secs:.1f} s")
+
+    # --- ui -------------------------------------------------------------
+    def _refresh_button_text(self) -> None:
+        recording = self.is_recording()
+        self.record_btn.setProperty("recording", "true" if recording else "false")
+        if recording:
+            self.record_btn.setText("⏹  Stop recording")
+        elif self.mode_push.isChecked():
+            self.record_btn.setText("⏺  Push and hold to record")
+        else:
+            self.record_btn.setText("⏺  Click to record")
+        self.record_btn.style().unpolish(self.record_btn)
+        self.record_btn.style().polish(self.record_btn)
+
+    def _update_duration(self) -> None:
+        if not self.is_recording():
+            return
+        secs = time.monotonic() - self._record_started_at
+        m, s = divmod(int(secs), 60)
+        self.duration_lbl.setText(f"⏺  {m:02d}:{s:02d}")
+
+
 class ModelPickerDialog(QDialog):
     """Modal popup that lets the user pick a model.
 
@@ -1143,13 +1405,15 @@ class MainWindow(QMainWindow):
         self._sys_timer.start(2000)
         self._refresh_sys_info()
 
-        # File group
-        file_box = QGroupBox("File")
-        fbl = QVBoxLayout(file_box)
+        # Source tabs: File (drop / open) vs Record (live capture)
+        self.source_tabs = QTabWidget()
+
+        file_tab = QWidget()
+        fbl = QVBoxLayout(file_tab)
+        fbl.setContentsMargins(10, 12, 10, 10)
         self.drop = DropLabel()
         self.drop.fileDropped.connect(self.set_file)
         fbl.addWidget(self.drop)
-
         path_row = QHBoxLayout()
         self.file_edit = QLineEdit()
         self.file_edit.setPlaceholderText("No file selected")
@@ -1159,7 +1423,18 @@ class MainWindow(QMainWindow):
         path_row.addWidget(self.file_edit, 1)
         path_row.addWidget(open_btn)
         fbl.addLayout(path_row)
-        root.addWidget(file_box)
+        self.source_tabs.addTab(file_tab, "File")
+
+        record_tab = QWidget()
+        rec_layout = QVBoxLayout(record_tab)
+        rec_layout.setContentsMargins(10, 12, 10, 10)
+        self.record_panel = RecordPanel()
+        self.record_panel.fileRecorded.connect(self._on_recording_finished)
+        self.record_panel.statusMessage.connect(self.statusBar().showMessage)
+        rec_layout.addWidget(self.record_panel)
+        self.source_tabs.addTab(record_tab, "Record")
+
+        root.addWidget(self.source_tabs)
 
         # Model — single full-width button summarising the current pick.
         # Click opens a modal popup; main window stays the same size.
@@ -1424,6 +1699,13 @@ class MainWindow(QMainWindow):
         self.settings["last_folder"] = str(p.parent)
         save_settings(self.settings)
 
+    def _on_recording_finished(self, path: str) -> None:
+        # Recording panel hands us a fresh WAV — wire it through the same
+        # set_file path so transcription picks it up. Switch to the File
+        # tab so the user sees the picked path is set.
+        self.set_file(path)
+        self.source_tabs.setCurrentIndex(0)
+
     # --- transcription --------------------------------------------------
     def start_transcription(self) -> None:
         if not self.current_file:
@@ -1640,6 +1922,11 @@ class MainWindow(QMainWindow):
         # Remember last window size so the next launch comes up the same way.
         self.settings["window_size"] = [self.width(), self.height()]
         save_settings(self.settings)
+        # Stop a recording in flight so we don't leak ffmpeg.
+        try:
+            self.record_panel.stop_if_recording()
+        except Exception:
+            pass
         # Tell the persistent worker to exit cleanly so the cached model
         # doesn't stay resident if the user just closed the window.
         try:
