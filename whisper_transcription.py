@@ -24,8 +24,8 @@ import time
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QPoint, QProcess, QProcessEnvironment, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QBrush, QColor, QGuiApplication, QDragEnterEvent, QDropEvent, QPainter
+from PyQt6.QtCore import QObject, QPoint, QProcess, QProcessEnvironment, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QBrush, QColor, QGuiApplication, QDragEnterEvent, QDropEvent, QIcon, QPainter
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -52,7 +52,9 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTabBar,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -586,22 +588,17 @@ def build_stylesheet(t: dict) -> str:
         background: {surface_hi};
         color: {accent};
     }}
-    /* Close button on a closeable tab: square × inset from the right
-       edge and vertically centred. Hover just brightens the glyph,
-       no coloured background. */
-    QTabBar::close-button {{
-        image: url({close_icon});
-        subcontrol-position: center right;
-        width: 12px;
-        height: 12px;
-        margin: 0 4px 0 6px;
-        padding: 0;
+    /* Close button: handled per-tab as an injected QToolButton (see
+       MainWindow._make_close_btn). Fusion ignores QSS positioning on
+       QTabBar::close-button itself, so we install a real widget. */
+    QToolButton#TabClose {{
         background: transparent;
+        border: none;
+        padding: 2px;
+        margin: 0;
+        border-radius: 3px;
     }}
-    QTabBar::close-button:hover {{
-        image: url({close_icon_hot});
-        background: transparent;
-    }}
+    QToolButton#TabClose:hover {{ background: transparent; }}
     /* QTextEdit inside a tab loses its 1 px border — otherwise it
        paints a horizontal line that pokes out next to the tab pill. */
     QTabWidget QTextEdit {{ border: none; }}
@@ -1874,13 +1871,18 @@ class MainWindow(QMainWindow):
         rbl = QVBoxLayout(result_box)
         self.result_tabs = QTabWidget()
         self.result_tabs.tabBar().setDrawBase(False)
-        self.result_tabs.setTabsClosable(True)
-        # Single connection, not per-tab — re-connecting with
-        # UniqueConnection inside _add_result_tab raises TypeError on
-        # the second call and crashed batch transcription after the
-        # first file.
-        self.result_tabs.tabCloseRequested.connect(self._on_tab_close)
+        # We install our own close buttons per tab via setTabButton —
+        # Fusion ignores QSS positioning on the built-in close-button
+        # subcontrol, so a real QToolButton is the only way to get the
+        # icon centred and inset from the tab edge.
+        self.result_tabs.setTabsClosable(False)
         self.result_tabs.setDocumentMode(True)
+        # Pre-generate close-icon paths once.
+        theme = load_theme()
+        muted_color = theme.get("color7", "#787c99")
+        fg_color = theme["foreground"]
+        self._close_icon_path = _close_svg_path(muted_color)
+        self._close_icon_hot_path = _close_svg_path(fg_color, "-hot")
         self._tab_results: list[dict] = []   # parallel to tab index
         self._tab_sources: list[str] = []    # source path per tab
         self._add_placeholder_tab()
@@ -1964,14 +1966,50 @@ class MainWindow(QMainWindow):
         edit.setPlainText(result.get("text", "").strip())
         title = self._short_tab_name(source_path)
         idx = self.result_tabs.addTab(edit, title)
-        # Show the full path on hover — short title is for the tab strip.
         if source_path:
             self.result_tabs.setTabToolTip(idx, source_path)
+        # Custom close button — bound to this specific QTextEdit so the
+        # button keeps working even after preceding tabs are closed and
+        # indexes shift.
+        self._install_close_button(idx, edit)
         self.result_tabs.setCurrentIndex(idx)
         self._tab_results.append(result)
         self._tab_sources.append(source_path)
         self.copy_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
+
+    def _install_close_button(self, index: int, owned_widget: QWidget) -> None:
+        btn = QToolButton()
+        btn.setObjectName("TabClose")
+        btn.setAutoRaise(True)
+        btn.setIcon(QIcon(self._close_icon_path))
+        btn.setIconSize(QSize(10, 10))
+        btn.setFixedSize(18, 18)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip("Close tab")
+        # Brighten the icon on hover.
+        btn.installEventFilter(self)
+        # Look up the tab by widget on click — index can shift if other
+        # tabs are closed first.
+        def _on_click():
+            for i in range(self.result_tabs.count()):
+                if self.result_tabs.widget(i) is owned_widget:
+                    self._on_tab_close(i)
+                    return
+        btn.clicked.connect(_on_click)
+        self.result_tabs.tabBar().setTabButton(
+            index, QTabBar.ButtonPosition.RightSide, btn
+        )
+
+    def eventFilter(self, obj, event):
+        # Swap close-button icon on hover/leave.
+        if isinstance(obj, QToolButton) and obj.objectName() == "TabClose":
+            from PyQt6.QtCore import QEvent
+            if event.type() == QEvent.Type.Enter:
+                obj.setIcon(QIcon(self._close_icon_hot_path))
+            elif event.type() == QEvent.Type.Leave:
+                obj.setIcon(QIcon(self._close_icon_path))
+        return super().eventFilter(obj, event)
 
     @staticmethod
     def _short_tab_name(source_path: str) -> str:
