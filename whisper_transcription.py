@@ -46,6 +46,7 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QStatusBar,
     QTableWidget,
@@ -82,13 +83,16 @@ MODELS: list[tuple[str, int, float]] = [
 # progress bar — whisper itself only ticks tqdm at 30-second clip
 # boundaries, so on a single-clip recording the bar would otherwise stay
 # at 0% the whole time.
+# Tuned to slightly UNDER-estimate (bar reaches 99 % a bit before whisper
+# is actually done) — feels much better than the bar lagging at ~60 %
+# while transcription has already finished.
 MODEL_RT_FACTOR: dict[str, float] = {
-    "tiny": 0.15,
-    "base": 0.5,
-    "small": 1.5,
-    "medium": 3.5,
-    "large-v3": 7.0,
-    "turbo": 1.0,
+    "tiny": 0.05,
+    "base": 0.2,
+    "small": 0.5,
+    "medium": 1.2,
+    "large-v3": 3.0,
+    "turbo": 0.7,
 }
 
 AUDIO_EXTS = {
@@ -412,12 +416,38 @@ def build_stylesheet(t: dict) -> str:
     QCheckBox:disabled::indicator {{ border-color: {border}; background: {bg}; image: none; }}
 
     QProgressBar {{
-        background: {surface}; color: {fg};
+        background: {surface};
+        color: {on_accent};
         border: 1px solid {border}; border-radius: 6px;
-        text-align: center; min-height: 26px;
+        text-align: center; min-height: 22px;
         font-weight: 700; font-size: 10pt;
     }}
     QProgressBar::chunk {{ background: {accent}; border-radius: 4px; }}
+
+    /* QSlider — used for CPU threads and RAM cap. Volume-bar style:
+       thin track, sub-page in accent, round handle. */
+    QSlider::groove:horizontal {{
+        height: 4px;
+        background: {surface_hi};
+        border-radius: 2px;
+    }}
+    QSlider::sub-page:horizontal {{
+        background: {accent};
+        border-radius: 2px;
+    }}
+    QSlider::add-page:horizontal {{
+        background: {surface_hi};
+        border-radius: 2px;
+    }}
+    QSlider::handle:horizontal {{
+        background: {fg};
+        width: 16px; height: 16px;
+        margin: -6px 0;
+        border-radius: 8px;
+    }}
+    QSlider::handle:horizontal:hover {{ background: {accent}; }}
+    QSlider:disabled::sub-page:horizontal {{ background: {muted}; }}
+    QSlider:disabled::handle:horizontal {{ background: {border}; }}
 
     QStatusBar {{ background: {surface}; color: {fg}; }}
     QStatusBar QLabel {{ color: {fg}; }}
@@ -1543,37 +1573,35 @@ class MainWindow(QMainWindow):
         self.model_warning.setContentsMargins(4, 0, 4, 0)
         root.addWidget(self.model_warning)
 
-        # Resources / language
+        # Resources / language. Sliders + N/M label so a full picture
+        # fits on a single line — spinboxes hid the available range.
         res_box = QGroupBox("Resources")
         form = QFormLayout(res_box)
         cpus = cpu_count()
-        self.cpu_spin = QSpinBox()
-        self.cpu_spin.setRange(1, cpus)
+        ram_total_int = max(1, int(total_ram_gb()))
+
+        self.cpu_slider = QSlider(Qt.Orientation.Horizontal)
+        self.cpu_slider.setRange(1, cpus)
         default_cpu = self.settings.get("cpu_threads", max(1, cpus // 2))
-        self.cpu_spin.setValue(min(default_cpu, cpus))
-        self.cpu_spin.setFixedWidth(140)
-        self.cpu_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.cpu_spin.setToolTip(f"1 – {cpus} available")
+        self.cpu_slider.setValue(min(default_cpu, cpus))
+        self.cpu_slider.setSingleStep(1)
+        self.cpu_slider.setPageStep(1)
+        self.cpu_slider.setMinimumWidth(180)
+        self.cpu_slider.setToolTip(f"1 – {cpus} CPU threads available")
+        self.cpu_value_lbl = QLabel()
+        self.cpu_value_lbl.setMinimumWidth(80)
+        self.cpu_slider.valueChanged.connect(self._refresh_resource_labels)
         cpu_row = QHBoxLayout()
         cpu_row.setContentsMargins(0, 0, 0, 0)
-        cpu_row.addWidget(self.cpu_spin)
-        cpu_row.addStretch(1)
+        cpu_row.setSpacing(10)
+        cpu_row.addWidget(self.cpu_slider, 1)
+        cpu_row.addWidget(self.cpu_value_lbl)
         cpu_wrap = QWidget()
         cpu_wrap.setLayout(cpu_row)
-        cpu_label = QLabel("CPU threads:")
-        cpu_label.setToolTip(f"1 – {cpus} available on this machine")
-        form.addRow(cpu_label, cpu_wrap)
+        form.addRow(QLabel("CPU threads:"), cpu_wrap)
 
-        # Hard RAM cap (systemd-run --user --scope -p MemoryMax=NG).
-        # One full-width row so the checkbox + spin always fits — no second
-        # form-label column to compete for horizontal space. A live hint
-        # row below explains in plain language what the toggle actually
-        # does in the current state.
-        ram_total_int = max(1, int(total_ram_gb()))
-        ram_row = QHBoxLayout()
-        ram_row.setContentsMargins(0, 0, 0, 0)
-        ram_row.setSpacing(8)
-        self.ram_cap_check = QCheckBox(f"Hard RAM cap (max {ram_total_int} GB)")
+        # Hard RAM cap. Checkbox toggles, slider sets the value.
+        self.ram_cap_check = QCheckBox("Hard RAM cap")
         cap_tip = (
             "Run the transcription worker inside a systemd cgroup with a "
             "memory ceiling. If it tries to use more than the cap, the "
@@ -1591,27 +1619,38 @@ class MainWindow(QMainWindow):
                 "systemd-run not found on PATH — hard cap unavailable."
             )
         self.ram_cap_check.setChecked(bool(self.settings.get("ram_cap_enabled", False)))
-        self.ram_cap_spin = QSpinBox()
-        self.ram_cap_spin.setRange(1, ram_total_int)
-        self.ram_cap_spin.setSuffix(" GB")
-        self.ram_cap_spin.setValue(min(self.settings.get("ram_cap_gb", max(2, ram_total_int // 2)), ram_total_int))
-        self.ram_cap_spin.setFixedWidth(140)
-        self.ram_cap_spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.ram_cap_spin.setEnabled(self.ram_cap_check.isChecked())
-        self.ram_cap_spin.setToolTip(cap_tip)
-        self.ram_cap_check.toggled.connect(self.ram_cap_spin.setEnabled)
+
+        self.ram_cap_slider = QSlider(Qt.Orientation.Horizontal)
+        self.ram_cap_slider.setRange(1, ram_total_int)
+        self.ram_cap_slider.setValue(
+            min(self.settings.get("ram_cap_gb", max(2, ram_total_int // 2)), ram_total_int)
+        )
+        self.ram_cap_slider.setMinimumWidth(180)
+        self.ram_cap_slider.setEnabled(self.ram_cap_check.isChecked())
+        self.ram_cap_slider.setToolTip(cap_tip)
+        self.ram_cap_value_lbl = QLabel()
+        self.ram_cap_value_lbl.setMinimumWidth(80)
+        self.ram_cap_check.toggled.connect(self.ram_cap_slider.setEnabled)
+        self.ram_cap_check.toggled.connect(lambda _: self._refresh_resource_labels())
+        self.ram_cap_slider.valueChanged.connect(self._refresh_resource_labels)
+        ram_row = QHBoxLayout()
+        ram_row.setContentsMargins(0, 0, 0, 0)
+        ram_row.setSpacing(10)
         ram_row.addWidget(self.ram_cap_check)
-        ram_row.addWidget(self.ram_cap_spin)
-        ram_row.addStretch(1)
+        ram_row.addWidget(self.ram_cap_slider, 1)
+        ram_row.addWidget(self.ram_cap_value_lbl)
         ram_widget = QWidget()
         ram_widget.setLayout(ram_row)
         form.addRow(ram_widget)
-
 
         self.lang_edit = QLineEdit()
         self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
         self.lang_edit.setText(self.settings.get("language", ""))
         form.addRow(QLabel("Language:"), self.lang_edit)
+
+        self._cpu_max = cpus
+        self._ram_max = ram_total_int
+        self._refresh_resource_labels()
 
         root.addWidget(res_box)
 
@@ -1628,20 +1667,35 @@ class MainWindow(QMainWindow):
         btns.addStretch(1)
         root.addLayout(btns)
 
+        # Progress: phase text lives on a label above the bar so it is
+        # always readable; the bar itself only shows the percentage so
+        # text and chunk fill never compete for legibility.
+        self.progress_phase_lbl = QLabel("")
+        self.progress_phase_lbl.setProperty("role", "muted")
+        self.progress_phase_lbl.setVisible(False)
+        root.addWidget(self.progress_phase_lbl)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
-        self.progress.setFormat("Idle")
+        self.progress.setFormat("%p%")
         self.progress.setVisible(False)
         root.addWidget(self.progress)
 
-        # Result
+        # Result tabs — one per transcription so a batch produces a tab
+        # per file; the user can flip between them and copy/save each.
         result_box = QGroupBox("Result")
         rbl = QVBoxLayout(result_box)
-        self.result_edit = QTextEdit()
-        self.result_edit.setPlaceholderText("Transcription will appear here.")
-        rbl.addWidget(self.result_edit)
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setTabsClosable(True)
+        self.result_tabs.tabCloseRequested.connect(
+            lambda i: self.result_tabs.removeTab(i)
+        )
+        self.result_tabs.setDocumentMode(True)
+        self._tab_results: list[dict] = []   # parallel to tab index
+        self._tab_sources: list[str] = []    # source path per tab
+        self._add_placeholder_tab()
+        rbl.addWidget(self.result_tabs)
         out_btns = QHBoxLayout()
         self.copy_btn = QPushButton("Copy to clipboard")
         self.copy_btn.clicked.connect(self.copy_result)
@@ -1697,6 +1751,67 @@ class MainWindow(QMainWindow):
         if self._current_model:
             self._update_model_warning(self._current_model)
 
+    # --- result tabs ----------------------------------------------------
+    def _add_placeholder_tab(self) -> None:
+        if self.result_tabs.count() != 0:
+            return
+        edit = QTextEdit()
+        edit.setPlaceholderText("Transcription will appear here.")
+        edit.setReadOnly(True)
+        self.result_tabs.addTab(edit, "Result")
+        # Hide the close button on the placeholder.
+        self.result_tabs.tabBar().setTabButton(0, self.result_tabs.tabBar().ButtonPosition.RightSide, None)
+        self._tab_results.append({})
+        self._tab_sources.append("")
+
+    def _add_result_tab(self, source_path: str, result: dict) -> None:
+        # Drop the placeholder tab once we have a real result.
+        if self.result_tabs.count() == 1 and not self._tab_results[0]:
+            self.result_tabs.removeTab(0)
+            self._tab_results.pop(0)
+            self._tab_sources.pop(0)
+        edit = QTextEdit()
+        edit.setReadOnly(False)
+        edit.setPlainText(result.get("text", "").strip())
+        title = Path(source_path).name if source_path else "Result"
+        idx = self.result_tabs.addTab(edit, title)
+        self.result_tabs.setCurrentIndex(idx)
+        self._tab_results.append(result)
+        self._tab_sources.append(source_path)
+        # When a tab is closed, drop our parallel state too.
+        self.result_tabs.tabCloseRequested.connect(self._on_tab_close, Qt.ConnectionType.UniqueConnection)
+        self.copy_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+
+    def _on_tab_close(self, index: int) -> None:
+        # Already removed by the lambda above; sync our parallel arrays.
+        if 0 <= index < len(self._tab_results):
+            self._tab_results.pop(index)
+            self._tab_sources.pop(index)
+        if self.result_tabs.count() == 0:
+            self.copy_btn.setEnabled(False)
+            self.save_btn.setEnabled(False)
+            self._add_placeholder_tab()
+
+    def _current_result(self) -> tuple[dict, str, QTextEdit | None]:
+        idx = self.result_tabs.currentIndex()
+        if idx < 0:
+            return ({}, "", None)
+        result = self._tab_results[idx] if idx < len(self._tab_results) else {}
+        source = self._tab_sources[idx] if idx < len(self._tab_sources) else ""
+        widget = self.result_tabs.widget(idx)
+        return (result, source, widget if isinstance(widget, QTextEdit) else None)
+
+    # --- resources ------------------------------------------------------
+    def _refresh_resource_labels(self) -> None:
+        self.cpu_value_lbl.setText(f"{self.cpu_slider.value()}/{self._cpu_max} threads")
+        if self.ram_cap_check.isChecked():
+            self.ram_cap_value_lbl.setText(
+                f"{self.ram_cap_slider.value()}/{self._ram_max} GB"
+            )
+        else:
+            self.ram_cap_value_lbl.setText(f"off · max {self._ram_max} GB")
+
     def _set_current_model(self, name: str, *, preload: bool = True) -> None:
         self._current_model = name
         self._update_model_button()
@@ -1706,11 +1821,11 @@ class MainWindow(QMainWindow):
         # initial selection during boot before the worker is wired).
         if preload and is_model_downloaded(name) and not self.worker.is_running():
             ram_cap_gb = self._current_ram_cap_gb()
-            self.worker.preload(name, self.cpu_spin.value(), ram_cap_gb)
+            self.worker.preload(name, self.cpu_slider.value(), ram_cap_gb)
 
     def _current_ram_cap_gb(self) -> int:
         if self.ram_cap_check.isChecked() and _systemd_run_available():
-            return self.ram_cap_spin.value()
+            return self.ram_cap_slider.value()
         return 0
 
     def _update_model_button(self) -> None:
@@ -1832,10 +1947,10 @@ class MainWindow(QMainWindow):
         if not model_name:
             QMessageBox.information(self, "No model", "Pick a model first.")
             return
-        cpu_threads = self.cpu_spin.value()
+        cpu_threads = self.cpu_slider.value()
         language = self.lang_edit.text().strip() or None
         ram_cap_enabled = self.ram_cap_check.isChecked() and _systemd_run_available()
-        ram_cap_gb = self.ram_cap_spin.value() if ram_cap_enabled else 0
+        ram_cap_gb = self.ram_cap_slider.value() if ram_cap_enabled else 0
 
         # Pre-flight RAM check (advisory, not enforced)
         ram_need = next((r for n, _, r in MODELS if n == model_name), 0.0)
@@ -1867,7 +1982,7 @@ class MainWindow(QMainWindow):
             "cpu_threads": cpu_threads,
             "language": language or "",
             "ram_cap_enabled": ram_cap_enabled,
-            "ram_cap_gb": self.ram_cap_spin.value(),
+            "ram_cap_gb": self.ram_cap_slider.value(),
         })
         save_settings(self.settings)
 
@@ -1882,10 +1997,7 @@ class MainWindow(QMainWindow):
         }
 
         self.set_running(True)
-        self.result_edit.clear()
         self.last_result = None
-        self.copy_btn.setEnabled(False)
-        self.save_btn.setEnabled(False)
 
         self._run_next_in_batch()
 
@@ -1908,16 +2020,16 @@ class MainWindow(QMainWindow):
         )
 
     def _on_worker_progress(self, msg: str) -> None:
-        # Status bar mirrors phase, the progress bar shows it inline so
-        # the user has something to read in the bar even when whisper
-        # hasn't ticked tqdm yet (short clips, model download, etc.).
+        # Phase text lives on a label above the bar, never overlaid on
+        # the chunk fill (where the colours conflict).
         self.statusBar().showMessage(msg)
         self._progress_phase = msg
-        # Reset bar at the start of each new phase. The transcribe
-        # phase additionally kicks off a time-based estimator that
-        # smoothly fills 0→99% while whisper churns on its single clip.
+        prefix = self._batch_prefix()
+        self.progress_phase_lbl.setText(f"{prefix}{msg}".strip())
+        # Reset bar at the start of each new phase. The transcribe phase
+        # additionally kicks off a time-based estimator that smoothly
+        # fills 0→99 % while whisper churns on its single clip.
         self.progress.setValue(0)
-        self.progress.setFormat(f"{msg}    0%")
         if msg.startswith("Transcribing"):
             self._start_progress_estimate()
         else:
@@ -1928,8 +2040,12 @@ class MainWindow(QMainWindow):
         # Real tqdm number wins if it's ahead of the time-based estimate.
         if pct > self.progress.value():
             self.progress.setValue(pct)
-        phase = getattr(self, "_progress_phase", "")
-        self.progress.setFormat(f"{phase}    %p%" if phase else "%p%")
+
+    def _batch_prefix(self) -> str:
+        total = len(self._file_queue)
+        if total > 1:
+            return f"File {min(self._batch_index + 1, total)}/{total} · "
+        return ""
 
     def _start_progress_estimate(self) -> None:
         duration = audio_duration_seconds(self.current_file or "")
@@ -1937,7 +2053,7 @@ class MainWindow(QMainWindow):
             (self._current_model or "").replace(".en", ""), 1.0
         )
         # Threads cut wall-clock roughly with sqrt(threads) before plateau.
-        threads = max(1, self.cpu_spin.value())
+        threads = max(1, self.cpu_slider.value())
         speedup = max(1.0, min(threads, 6) ** 0.6)
         self._estimate_total = max(2.0, duration * factor / speedup)
         self._estimate_started = time.monotonic()
@@ -1967,27 +2083,22 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         self.progress.setVisible(running)
+        self.progress_phase_lbl.setVisible(running)
         if running:
-            # Always determinate so the bar is visible from frame 0;
-            # custom QSS made the indeterminate state look like an
-            # empty placeholder. The phase text inside the bar tells
-            # the user something is happening before tqdm ticks.
             self._progress_phase = "Starting…"
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
-            self.progress.setFormat("Starting…    0%")
+            self.progress_phase_lbl.setText(f"{self._batch_prefix()}Starting…")
             self.model_warning.setVisible(False)
         else:
             self._estimate_timer.stop()
             self.progress.setValue(0)
-            self.progress.setFormat("Idle")
+            self.progress_phase_lbl.setText("")
             self.model_warning.setVisible(bool(self.model_warning.text()))
 
     def on_transcribe_done(self, result: dict) -> None:
         self.last_result = result
-        self.result_edit.setPlainText(result.get("text", "").strip())
-        self.copy_btn.setEnabled(True)
-        self.save_btn.setEnabled(True)
+        self._add_result_tab(self.current_file or "", result)
         self._update_model_button()
 
         total = len(self._file_queue)
@@ -2023,13 +2134,17 @@ class MainWindow(QMainWindow):
 
     # --- output ---------------------------------------------------------
     def copy_result(self) -> None:
-        QGuiApplication.clipboard().setText(self.result_edit.toPlainText())
+        _result, _src, edit = self._current_result()
+        if edit is None:
+            return
+        QGuiApplication.clipboard().setText(edit.toPlainText())
         self.statusBar().showMessage("Copied to clipboard")
 
     def save_result(self) -> None:
-        if not self.last_result:
+        result, source, edit = self._current_result()
+        if not result or edit is None:
             return
-        default = Path(self.current_file or "transcript").with_suffix(".txt").name
+        default = Path(source or "transcript").with_suffix(".txt").name
         path, _ = QFileDialog.getSaveFileName(
             self, "Save transcription", default,
             "Plain text (*.txt);;SubRip (*.srt);;WebVTT (*.vtt);;JSON (*.json)",
@@ -2039,13 +2154,13 @@ class MainWindow(QMainWindow):
         ext = Path(path).suffix.lower()
         try:
             if ext == ".srt":
-                Path(path).write_text(self._to_srt(self.last_result))
+                Path(path).write_text(self._to_srt(result))
             elif ext == ".vtt":
-                Path(path).write_text(self._to_vtt(self.last_result))
+                Path(path).write_text(self._to_vtt(result))
             elif ext == ".json":
-                Path(path).write_text(json.dumps(self.last_result, indent=2, ensure_ascii=False))
+                Path(path).write_text(json.dumps(result, indent=2, ensure_ascii=False))
             else:
-                Path(path).write_text(self.result_edit.toPlainText())
+                Path(path).write_text(edit.toPlainText())
             self.statusBar().showMessage(f"Saved to {path}")
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))
