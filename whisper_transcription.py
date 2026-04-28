@@ -1176,6 +1176,20 @@ class ModelPicker(QWidget):
             card.refresh_status()
 
 
+class CollapsingStack(QStackedWidget):
+    """QStackedWidget that sizes to the current page, not max of all
+    pages. Default QStackedWidget reserves height = max(all sizeHints),
+    so File page would always reserve Live's tall area."""
+
+    def sizeHint(self):  # noqa: N802 (Qt naming)
+        w = self.currentWidget()
+        return w.sizeHint() if w is not None else super().sizeHint()
+
+    def minimumSizeHint(self):  # noqa: N802
+        w = self.currentWidget()
+        return w.minimumSizeHint() if w is not None else super().minimumSizeHint()
+
+
 class ThemeSlider(QWidget):
     """Hand-painted slider — replaces QSlider because Qt's QSS engine
     insists on painting a slider widget body underneath the track no
@@ -2143,13 +2157,12 @@ class MainWindow(QMainWindow):
         # collapses to the current page's natural size.
         self.source_tab_bar = QTabBar()
         self.source_tab_bar.setDrawBase(False)
+        self.source_tab_bar.setExpanding(False)
         self.source_tab_bar.addTab("File")
         self.source_tab_bar.addTab("Record")
         self.source_tab_bar.addTab("Live")
 
-        self.source_pages = QStackedWidget()
-        # Honour the current page's vertical hint and don't reserve
-        # extra height for the unused pages.
+        self.source_pages = CollapsingStack()
         self.source_pages.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
         )
@@ -2196,6 +2209,11 @@ class MainWindow(QMainWindow):
         # Wire the tab bar to the stack and to the chrome-toggle.
         self.source_tab_bar.currentChanged.connect(self.source_pages.setCurrentIndex)
         self.source_tab_bar.currentChanged.connect(self._on_source_tab_changed)
+        # Re-ask the parent layout for a size when the current page
+        # changes — otherwise the stack stays at its previous height.
+        self.source_pages.currentChanged.connect(
+            lambda _i: self.source_pages.updateGeometry()
+        )
 
         root.addWidget(self.source_tab_bar)
         root.addWidget(self.source_pages)
