@@ -540,32 +540,29 @@ def build_stylesheet(t: dict) -> str:
         color: {fg};
     }}
 
-    /* Tabs at the top of the main window (File / Record) */
+    /* Tabs — chip-style, no frame around the pane and no QTabBar base
+       line (the latter was the white seam that kept showing up
+       between the GroupBox header and the first tab). */
     QTabWidget {{ background-color: {bg}; }}
     QTabWidget::pane {{
-        border: 1px solid {border};
-        border-radius: 8px;
-        top: -1px;
+        border: none;
         background-color: {bg};
+        top: 0;
     }}
-    QTabBar {{ background-color: {bg}; }}
+    QTabBar {{ background-color: {bg}; border: none; }}
     QTabBar::tab {{
-        background: {bg};
+        background: transparent;
         color: {muted};
-        padding: 8px 18px;
-        border: 1px solid transparent;
-        border-bottom: none;
-        border-top-left-radius: 8px;
-        border-top-right-radius: 8px;
-        margin-right: 2px;
+        padding: 8px 16px;
+        border: none;
+        border-radius: 6px;
+        margin: 0 4px 4px 0;
         font-weight: 600;
     }}
     QTabBar::tab:hover {{ color: {fg}; }}
     QTabBar::tab:selected {{
-        background: {bg};
+        background: {surface_hi};
         color: {accent};
-        border: 1px solid {border};
-        border-bottom: 1px solid {bg};
     }}
 
     /* Segmented control: two/three pill-buttons sharing borders */
@@ -1678,6 +1675,8 @@ class MainWindow(QMainWindow):
 
         # Source tabs: File (drop / open) vs Record (live capture)
         self.source_tabs = QTabWidget()
+        self.source_tabs.tabBar().setDrawBase(False)
+        self.source_tabs.setDocumentMode(True)
 
         file_tab = QWidget()
         fbl = QVBoxLayout(file_tab)
@@ -1833,6 +1832,7 @@ class MainWindow(QMainWindow):
         result_box = QGroupBox("Result")
         rbl = QVBoxLayout(result_box)
         self.result_tabs = QTabWidget()
+        self.result_tabs.tabBar().setDrawBase(False)
         self.result_tabs.setTabsClosable(True)
         # Single connection, not per-tab — re-connecting with
         # UniqueConnection inside _add_result_tab raises TypeError on
