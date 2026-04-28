@@ -337,7 +337,7 @@ def build_stylesheet(t: dict) -> str:
     arrow_down_hot = _arrow_svg_path("down", on_accent, "-hot")
     check_mark = _check_svg_path(on_accent)
     close_icon = _close_svg_path(muted)
-    close_icon_hot = _close_svg_path(on_accent, "-hot")
+    close_icon_hot = _close_svg_path(fg, "-hot")
     return f"""
     QMainWindow, QDialog, QWidget {{
         background-color: {bg};
@@ -586,22 +586,21 @@ def build_stylesheet(t: dict) -> str:
         background: {surface_hi};
         color: {accent};
     }}
-    /* Close button on a closeable tab: square 14×14 pill with a
-       theme-coloured ×, sitting flush against the label. Default
-       Qt close icon is invisible against our dark theme so we draw
-       our own SVG and reference it explicitly. */
+    /* Close button on a closeable tab: square × inset from the right
+       edge and vertically centred. Hover just brightens the glyph,
+       no coloured background. */
     QTabBar::close-button {{
         image: url({close_icon});
-        subcontrol-position: right;
-        width: 14px;
-        height: 14px;
-        margin: 0 2px 0 4px;
+        subcontrol-position: center right;
+        width: 12px;
+        height: 12px;
+        margin: 0 4px 0 6px;
         padding: 0;
-        border-radius: 3px;
+        background: transparent;
     }}
     QTabBar::close-button:hover {{
         image: url({close_icon_hot});
-        background: {danger};
+        background: transparent;
     }}
     /* QTextEdit inside a tab loses its 1 px border — otherwise it
        paints a horizontal line that pokes out next to the tab pill. */
