@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -1059,14 +1060,6 @@ class MainWindow(QMainWindow):
         ram_widget.setLayout(ram_row)
         form.addRow(ram_widget)
 
-        self.ram_cap_hint = QLabel()
-        self.ram_cap_hint.setProperty("role", "muted")
-        self.ram_cap_hint.setWordWrap(True)
-        self.ram_cap_hint.setContentsMargins(0, 0, 0, 0)
-        self.ram_cap_check.toggled.connect(self._refresh_ram_cap_hint)
-        self.ram_cap_spin.valueChanged.connect(lambda _v: self._refresh_ram_cap_hint())
-        form.addRow(self.ram_cap_hint)
-        self._refresh_ram_cap_hint()
 
         self.lang_edit = QLineEdit()
         self.lang_edit.setPlaceholderText("auto-detect (or e.g. en, ru, de)")
@@ -1153,26 +1146,6 @@ class MainWindow(QMainWindow):
         )
         if self._current_model:
             self._update_model_warning(self._current_model)
-
-    def _refresh_ram_cap_hint(self) -> None:
-        if not _systemd_run_available():
-            self.ram_cap_hint.setText(
-                "systemd-run not available — hard cap can't be applied."
-            )
-            return
-        if self.ram_cap_check.isChecked():
-            cap = self.ram_cap_spin.value()
-            self.ram_cap_hint.setText(
-                f"On — kernel will kill the worker if it allocates more "
-                f"than {cap} GB. Useful to keep heavy models from "
-                f"monopolising RAM. Picking less than the model needs "
-                f"causes an OOM right after model load."
-            )
-        else:
-            self.ram_cap_hint.setText(
-                "Off — worker may use as much RAM as available. "
-                "Tick to make the kernel kill it past a chosen budget."
-            )
 
     def _set_current_model(self, name: str) -> None:
         self._current_model = name
@@ -1407,8 +1380,35 @@ class MainWindow(QMainWindow):
         )
 
 
+def _ensure_hyprland_floating() -> None:
+    """Tell Hyprland to float windows of this app, if running under Hyprland.
+
+    Registers a transient `windowrule` via `hyprctl keyword`. The rule
+    persists for the current Hyprland session — fast, scoped, and
+    doesn't touch the user's hyprland.conf. Re-applied on every launch
+    so the rule survives Hyprland restarts.
+    """
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return
+    if not shutil.which("hyprctl"):
+        return
+    try:
+        subprocess.run(
+            [
+                "hyprctl", "keyword", "windowrule",
+                f"float on, match:class ^({APP_ID})$",
+            ],
+            timeout=2,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 def main() -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+    _ensure_hyprland_floating()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setDesktopFileName(APP_ID)
