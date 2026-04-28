@@ -24,8 +24,8 @@ import time
 import traceback
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QGuiApplication, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import QObject, QPoint, QProcess, QProcessEnvironment, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QBrush, QColor, QGuiApplication, QDragEnterEvent, QDropEvent, QPainter
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -1094,6 +1094,133 @@ class ModelPicker(QWidget):
             card.refresh_status()
 
 
+class ThemeSlider(QWidget):
+    """Hand-painted slider — replaces QSlider because Qt's QSS engine
+    insists on painting a slider widget body underneath the track no
+    matter how aggressively we mark it transparent. Pure paintEvent +
+    mouse handling gives us a clean track + handle on the parent's
+    background with zero hidden rectangles.
+    """
+
+    valueChanged = pyqtSignal(int)
+
+    def __init__(self, theme: dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._theme = theme
+        self._min = 0
+        self._max = 100
+        self._value = 0
+        self._dragging = False
+        self.setMinimumHeight(22)
+        self.setMinimumWidth(140)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # We paint everything ourselves; no widget bg fill.
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    # --- API mirroring the parts of QSlider we use --------------------
+    def setRange(self, mn: int, mx: int) -> None:
+        self._min, self._max = int(mn), int(mx)
+        self._value = max(self._min, min(self._max, self._value))
+        self.update()
+
+    def setValue(self, v: int) -> None:
+        v = max(self._min, min(self._max, int(v)))
+        if v == self._value:
+            return
+        self._value = v
+        self.update()
+        self.valueChanged.emit(v)
+
+    def value(self) -> int:
+        return self._value
+
+    # --- geometry helpers ---------------------------------------------
+    _HANDLE_R = 8         # handle radius (px)
+    _TRACK_H = 4          # track height (px)
+
+    def _track_rect(self) -> tuple[int, int, int, int]:
+        # x, y, w, h  — track inset by handle radius so the handle
+        # never spills outside the widget bounds.
+        w = self.width()
+        h = self.height()
+        x = self._HANDLE_R
+        track_w = max(1, w - 2 * self._HANDLE_R)
+        y = (h - self._TRACK_H) // 2
+        return x, y, track_w, self._TRACK_H
+
+    def _handle_x(self) -> int:
+        x, _, w, _ = self._track_rect()
+        if self._max <= self._min:
+            return x
+        t = (self._value - self._min) / (self._max - self._min)
+        return x + int(round(t * w))
+
+    # --- painting ------------------------------------------------------
+    def paintEvent(self, _ev) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        track_color = QColor(self._theme.get("color8", "#444b6a"))
+        if self.isEnabled():
+            fill_color = QColor(self._theme.get("accent", "#7aa2f7"))
+            handle_color = QColor(self._theme["foreground"])
+        else:
+            fill_color = QColor(self._theme.get("color7", "#787c99"))
+            handle_color = QColor(self._theme.get("color8", "#444b6a"))
+
+        x, y, w, h = self._track_rect()
+        p.setPen(Qt.PenStyle.NoPen)
+        # Empty track
+        p.setBrush(QBrush(track_color))
+        p.drawRoundedRect(x, y, w, h, 2, 2)
+        # Filled portion
+        hx = self._handle_x()
+        if hx > x:
+            p.setBrush(QBrush(fill_color))
+            p.drawRoundedRect(x, y, hx - x, h, 2, 2)
+        # Handle
+        p.setBrush(QBrush(handle_color))
+        p.drawEllipse(QPoint(hx, self.height() // 2), self._HANDLE_R, self._HANDLE_R)
+        p.end()
+
+    # --- input ---------------------------------------------------------
+    def _value_from_x(self, px: float) -> int:
+        x, _, w, _ = self._track_rect()
+        if w <= 0:
+            return self._min
+        t = (px - x) / w
+        t = max(0.0, min(1.0, t))
+        return int(round(self._min + t * (self._max - self._min)))
+
+    def mousePressEvent(self, ev) -> None:
+        if not self.isEnabled():
+            return
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self.setValue(self._value_from_x(ev.position().x()))
+
+    def mouseMoveEvent(self, ev) -> None:
+        if self._dragging and self.isEnabled():
+            self.setValue(self._value_from_x(ev.position().x()))
+
+    def mouseReleaseEvent(self, _ev) -> None:
+        self._dragging = False
+
+    def wheelEvent(self, ev) -> None:
+        if not self.isEnabled():
+            return
+        step = 1 if ev.angleDelta().y() > 0 else -1
+        self.setValue(self._value + step)
+
+    def changeEvent(self, ev) -> None:
+        # Repaint when the enable state flips (greyed-out colours).
+        super().changeEvent(ev)
+        from PyQt6.QtCore import QEvent
+        if ev.type() == QEvent.Type.EnabledChange:
+            self.update()
+
+
 class SegmentedControl(QWidget):
     """Two- or three-segment toggle. Reads as a single visual unit, not
     as scattered radio buttons. Used for Source / Trigger choices in
@@ -1601,15 +1728,12 @@ class MainWindow(QMainWindow):
         cpus = cpu_count()
         ram_total_int = max(1, int(total_ram_gb()))
 
-        self.cpu_slider = QSlider(Qt.Orientation.Horizontal)
+        self.cpu_slider = ThemeSlider(load_theme())
         self.cpu_slider.setRange(1, cpus)
         default_cpu = self.settings.get("cpu_threads", max(1, cpus // 2))
         self.cpu_slider.setValue(min(default_cpu, cpus))
-        self.cpu_slider.setSingleStep(1)
-        self.cpu_slider.setPageStep(1)
         self.cpu_slider.setMinimumWidth(180)
         self.cpu_slider.setToolTip(f"1 – {cpus} CPU threads available")
-        self.cpu_slider.setStyleSheet(slider_stylesheet(load_theme()))
         self.cpu_value_lbl = QLabel()
         self.cpu_value_lbl.setMinimumWidth(80)
         self.cpu_slider.valueChanged.connect(self._refresh_resource_labels)
@@ -1642,7 +1766,7 @@ class MainWindow(QMainWindow):
             )
         self.ram_cap_check.setChecked(bool(self.settings.get("ram_cap_enabled", False)))
 
-        self.ram_cap_slider = QSlider(Qt.Orientation.Horizontal)
+        self.ram_cap_slider = ThemeSlider(load_theme())
         self.ram_cap_slider.setRange(1, ram_total_int)
         self.ram_cap_slider.setValue(
             min(self.settings.get("ram_cap_gb", max(2, ram_total_int // 2)), ram_total_int)
@@ -1650,7 +1774,6 @@ class MainWindow(QMainWindow):
         self.ram_cap_slider.setMinimumWidth(180)
         self.ram_cap_slider.setEnabled(self.ram_cap_check.isChecked())
         self.ram_cap_slider.setToolTip(cap_tip)
-        self.ram_cap_slider.setStyleSheet(slider_stylesheet(load_theme()))
         self.ram_cap_value_lbl = QLabel()
         self.ram_cap_value_lbl.setMinimumWidth(80)
         self.ram_cap_check.toggled.connect(self.ram_cap_slider.setEnabled)
