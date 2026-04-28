@@ -247,37 +247,35 @@ def _arrow_svg_path(direction: str, color: str, suffix: str = "") -> str:
 
 
 def slider_stylesheet(t: dict) -> str:
-    """Per-instance stylesheet for QSlider — applied with setStyleSheet
-    on each slider instance so it beats the global QWidget bg cascade
-    (which otherwise paints a dark rectangle behind the track)."""
+    """Per-instance stylesheet for QSlider — beats the global QWidget bg
+    cascade. Key insight: only style the groove and the handle. Letting
+    `add-page` (the empty side of the track) inherit a background paints
+    the full slider-widget rectangle — instead leave it transparent so
+    the groove (4 px tall) is the only visible track segment.
+    """
     accent = t.get("accent") or t.get("color4", "#7aa2f7")
     border = t.get("color8", "#444b6a")
     muted = t.get("color7", "#787c99")
     fg = t["foreground"]
     surface_hi = t.get("color8", "#444b6a")
     return f"""
-        QSlider {{ background: transparent; }}
+        QSlider {{ background: transparent; border: none; }}
         QSlider::groove:horizontal {{
             height: 4px;
             background-color: {surface_hi};
             border-radius: 2px;
-            margin: 0 9px;
         }}
         QSlider::sub-page:horizontal {{
             background-color: {accent};
             border-radius: 2px;
-            margin: 0 9px;
         }}
         QSlider::add-page:horizontal {{
-            background-color: {surface_hi};
-            border-radius: 2px;
-            margin: 0 9px;
+            background: transparent;
         }}
         QSlider::handle:horizontal {{
             background-color: {fg};
             width: 16px;
-            height: 16px;
-            margin: -6px 0;
+            margin: -7px 0;
             border-radius: 8px;
         }}
         QSlider::handle:horizontal:hover {{ background-color: {accent}; }}
@@ -543,13 +541,16 @@ def build_stylesheet(t: dict) -> str:
     }}
 
     /* Tabs at the top of the main window (File / Record) */
+    QTabWidget {{ background-color: {bg}; }}
     QTabWidget::pane {{
         border: 1px solid {border};
         border-radius: 8px;
         top: -1px;
+        background-color: {bg};
     }}
+    QTabBar {{ background-color: {bg}; }}
     QTabBar::tab {{
-        background: transparent;
+        background: {bg};
         color: {muted};
         padding: 8px 18px;
         border: 1px solid transparent;
@@ -1710,9 +1711,11 @@ class MainWindow(QMainWindow):
         rbl = QVBoxLayout(result_box)
         self.result_tabs = QTabWidget()
         self.result_tabs.setTabsClosable(True)
-        self.result_tabs.tabCloseRequested.connect(
-            lambda i: self.result_tabs.removeTab(i)
-        )
+        # Single connection, not per-tab — re-connecting with
+        # UniqueConnection inside _add_result_tab raises TypeError on
+        # the second call and crashed batch transcription after the
+        # first file.
+        self.result_tabs.tabCloseRequested.connect(self._on_tab_close)
         self.result_tabs.setDocumentMode(True)
         self._tab_results: list[dict] = []   # parallel to tab index
         self._tab_sources: list[str] = []    # source path per tab
@@ -1800,13 +1803,12 @@ class MainWindow(QMainWindow):
         self.result_tabs.setCurrentIndex(idx)
         self._tab_results.append(result)
         self._tab_sources.append(source_path)
-        # When a tab is closed, drop our parallel state too.
-        self.result_tabs.tabCloseRequested.connect(self._on_tab_close, Qt.ConnectionType.UniqueConnection)
         self.copy_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
 
     def _on_tab_close(self, index: int) -> None:
-        # Already removed by the lambda above; sync our parallel arrays.
+        if 0 <= index < self.result_tabs.count():
+            self.result_tabs.removeTab(index)
         if 0 <= index < len(self._tab_results):
             self._tab_results.pop(index)
             self._tab_sources.pop(index)
