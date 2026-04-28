@@ -938,8 +938,18 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_file: str | None = None):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(880, 760)
         self.settings = load_settings()
+        # Restore last window size if remembered, else use a sensible default
+        # for a fresh install. Position is left to the compositor.
+        saved = self.settings.get("window_size")
+        if (
+            isinstance(saved, list)
+            and len(saved) == 2
+            and all(isinstance(v, int) and 320 <= v <= 4000 for v in saved)
+        ):
+            self.resize(saved[0], saved[1])
+        else:
+            self.resize(720, 820)
         self.current_file: str | None = None
         self.last_result: dict | None = None
         self._current_model: str | None = None
@@ -1378,6 +1388,12 @@ class MainWindow(QMainWindow):
             f"Models cache: {WHISPER_CACHE}\nConfig: {CONFIG_FILE}\n"
             f"Theme: {THEME_COLORS_PATH if THEME_COLORS_PATH.exists() else 'built-in default'}",
         )
+
+    def closeEvent(self, event) -> None:
+        # Remember last window size so the next launch comes up the same way.
+        self.settings["window_size"] = [self.width(), self.height()]
+        save_settings(self.settings)
+        super().closeEvent(event)
 
 
 def _ensure_hyprland_floating() -> None:
