@@ -552,7 +552,7 @@ def build_stylesheet(t: dict) -> str:
         border: 2px dashed {border};
         border-radius: 8px;
         color: {muted};
-        padding: 18px;
+        padding: 8px;
         font-weight: 500;
     }}
     DropLabel[hasFile="true"] {{
@@ -1046,7 +1046,8 @@ class DropLabel(QLabel):
         super().__init__()
         self.setObjectName("DropLabel")
         self.setAcceptDrops(True)
-        self.setMinimumHeight(90)
+        self.setMinimumHeight(45)
+        self.setMaximumHeight(60)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setProperty("hasFile", "false")
         self.setText("Drop audio/video files here  ·  or click Open File…")
