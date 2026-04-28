@@ -2136,8 +2136,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(8, 4, 8, 4)
-        root.setSpacing(2)
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(6)
 
         # System info bar (live) — kept bright like terminal text
         self.sys_info = QLabel()
@@ -2169,8 +2169,8 @@ class MainWindow(QMainWindow):
 
         file_tab = QWidget()
         fbl = QVBoxLayout(file_tab)
-        fbl.setContentsMargins(0, 0, 0, 0)
-        fbl.setSpacing(2)
+        fbl.setContentsMargins(0, 4, 0, 0)
+        fbl.setSpacing(6)
         self.drop = DropLabel()
         self.drop.filesDropped.connect(self.set_files)
         fbl.addWidget(self.drop)
@@ -2187,7 +2187,7 @@ class MainWindow(QMainWindow):
 
         record_tab = QWidget()
         rec_layout = QVBoxLayout(record_tab)
-        rec_layout.setContentsMargins(4, 6, 4, 4)
+        rec_layout.setContentsMargins(0, 4, 0, 0)
         self.record_panel = RecordPanel()
         self.record_panel.fileRecorded.connect(self._on_recording_finished)
         self.record_panel.statusMessage.connect(self.statusBar().showMessage)
@@ -2196,7 +2196,7 @@ class MainWindow(QMainWindow):
 
         live_tab = QWidget()
         live_layout = QVBoxLayout(live_tab)
-        live_layout.setContentsMargins(4, 6, 4, 4)
+        live_layout.setContentsMargins(0, 4, 0, 0)
         self.live_panel = LivePanel()
         self.live_panel.set_default_language(self.settings.get("language", ""))
         self.live_panel.chunkRecorded.connect(self._on_live_chunk_recorded)
@@ -2354,6 +2354,26 @@ class MainWindow(QMainWindow):
             running = self.worker.is_running()
             self.progress_phase_lbl.setVisible(running)
             self.progress.setVisible(running)
+        # Direct any extra vertical space to whichever section can use
+        # it — Live's text area on Live, otherwise the Result tabs.
+        # Without this the freed space (when result_box is hidden) gets
+        # spread across the labels above, leaving big gaps around the
+        # 'System · RAM …' line.
+        root = self.centralWidget().layout()
+        pages_idx = root.indexOf(self.source_pages)
+        result_idx = root.indexOf(self.result_box)
+        if pages_idx >= 0:
+            root.setStretch(pages_idx, 1 if is_live else 0)
+        if result_idx >= 0:
+            root.setStretch(result_idx, 0 if is_live else 1)
+        # Source pages cap themselves at the current page's hint on
+        # File/Record (so they collapse around drop+open). On Live we
+        # want the page to consume extra height, so flip the size
+        # policy to Expanding.
+        self.source_pages.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding if is_live else QSizePolicy.Policy.Maximum,
+        )
 
     # --- system info ----------------------------------------------------
     def _refresh_sys_info(self) -> None:
