@@ -557,10 +557,10 @@ def build_stylesheet(t: dict) -> str:
     QTabBar::tab {{
         background: transparent;
         color: {muted};
-        padding: 8px 16px;
+        padding: 6px 10px;
         border: none;
         border-radius: 6px;
-        margin: 0 4px 4px 0;
+        margin: 0 3px 4px 0;
         font-weight: 600;
     }}
     QTabBar::tab:hover {{ color: {fg}; }}
@@ -568,6 +568,15 @@ def build_stylesheet(t: dict) -> str:
         background: {surface_hi};
         color: {accent};
     }}
+    /* Close button on a closeable tab: small, tucked next to the
+       label, accent on hover so it's a real affordance. */
+    QTabBar::close-button {{
+        subcontrol-position: right;
+        margin: 0 2px 0 6px;
+        padding: 0;
+        border-radius: 3px;
+    }}
+    QTabBar::close-button:hover {{ background: {danger}; }}
     /* QTextEdit inside a tab loses its 1 px border — otherwise it
        paints a horizontal line that pokes out next to the tab pill. */
     QTabWidget QTextEdit {{ border: none; }}
@@ -1928,13 +1937,29 @@ class MainWindow(QMainWindow):
         edit = QTextEdit()
         edit.setReadOnly(False)
         edit.setPlainText(result.get("text", "").strip())
-        title = Path(source_path).name if source_path else "Result"
+        title = self._short_tab_name(source_path)
         idx = self.result_tabs.addTab(edit, title)
+        # Show the full path on hover — short title is for the tab strip.
+        if source_path:
+            self.result_tabs.setTabToolTip(idx, source_path)
         self.result_tabs.setCurrentIndex(idx)
         self._tab_results.append(result)
         self._tab_sources.append(source_path)
         self.copy_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
+
+    @staticmethod
+    def _short_tab_name(source_path: str) -> str:
+        """Truncate a filename to the form `abc..xyz.ext` so result tabs
+        don't blow out horizontally on long names like
+        `recording-1777379054.wav`."""
+        if not source_path:
+            return "Result"
+        p = Path(source_path)
+        stem, ext = p.stem, p.suffix
+        if len(stem) <= 8:
+            return p.name
+        return f"{stem[:3]}..{stem[-3:]}{ext}"
 
     def _on_tab_close(self, index: int) -> None:
         if 0 <= index < self.result_tabs.count():
@@ -2221,8 +2246,8 @@ class MainWindow(QMainWindow):
         pct = int(min(99, 100 * elapsed / max(0.5, self._estimate_total)))
         if pct > self.progress.value():
             self.progress.setValue(pct)
-            phase = getattr(self, "_progress_phase", "")
-            self.progress.setFormat(f"{phase}    %p%" if phase else "%p%")
+        # Phase text lives on the label above the bar; the bar's
+        # internal text stays as just %p% (set once in __init__).
 
     def cancel_transcription(self) -> None:
         if self.worker.is_running():
