@@ -425,19 +425,28 @@ def build_stylesheet(t: dict) -> str:
     QProgressBar::chunk {{ background: {accent}; border-radius: 4px; }}
 
     /* QSlider — used for CPU threads and RAM cap. Volume-bar style:
-       thin track, sub-page in accent, round handle. */
+       thin track, sub-page in accent, round handle floating on the
+       parent background (no slider-body fill). */
+    QSlider {{
+        background: transparent;
+        min-height: 22px;
+    }}
     QSlider::groove:horizontal {{
         height: 4px;
         background: {surface_hi};
         border-radius: 2px;
+        /* Side margin so the round handle has room at the extremes
+           and isn't clipped by the slider widget's edge. */
+        margin: 0 9px;
     }}
     QSlider::sub-page:horizontal {{
         background: {accent};
         border-radius: 2px;
+        margin: 0 9px;
     }}
     QSlider::add-page:horizontal {{
-        background: {surface_hi};
-        border-radius: 2px;
+        background: transparent;
+        margin: 0 9px;
     }}
     QSlider::handle:horizontal {{
         background: {fg};
