@@ -2156,6 +2156,10 @@ class MainWindow(QMainWindow):
         path_row.addWidget(self.file_edit, 1)
         path_row.addWidget(open_btn)
         fbl.addLayout(path_row)
+        # Push content to the top — QTabWidget sizes the pane to the
+        # tallest tab (Live), so without a trailing stretch File and
+        # Record have a big empty band centred between their widgets.
+        fbl.addStretch(1)
         self.source_tabs.addTab(file_tab, "File")
 
         record_tab = QWidget()
@@ -2165,6 +2169,7 @@ class MainWindow(QMainWindow):
         self.record_panel.fileRecorded.connect(self._on_recording_finished)
         self.record_panel.statusMessage.connect(self.statusBar().showMessage)
         rec_layout.addWidget(self.record_panel)
+        rec_layout.addStretch(1)
         self.source_tabs.addTab(record_tab, "Record")
 
         live_tab = QWidget()
