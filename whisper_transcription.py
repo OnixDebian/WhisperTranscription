@@ -283,8 +283,15 @@ def build_stylesheet(t: dict) -> str:
     arrow_down_hot = _arrow_svg_path("down", on_accent, "-hot")
     check_mark = _check_svg_path(on_accent)
     return f"""
-    QMainWindow, QDialog, QWidget {{
-        background: {bg};
+    QMainWindow, QDialog {{
+        background-color: {bg};
+        color: {fg};
+        font-size: 10pt;
+    }}
+    /* Cascade text colour and font to all widgets, but DO NOT cascade
+       a background-color — that would override our transparent slider
+       and other widgets that paint just their sub-controls. */
+    QWidget {{
         color: {fg};
         font-size: 10pt;
     }}
@@ -426,37 +433,37 @@ def build_stylesheet(t: dict) -> str:
 
     /* QSlider — used for CPU threads and RAM cap. Volume-bar style:
        thin track, sub-page in accent, round handle floating on the
-       parent background (no slider-body fill). */
-    QSlider {{
-        background: transparent;
-        min-height: 22px;
-    }}
+       parent background (no slider-body fill). The widget itself is
+       made transparent via WA_StyledBackground=False on the instance
+       so the global QWidget {{background: bg}} cascade can't paint
+       over us. */
     QSlider::groove:horizontal {{
         height: 4px;
-        background: {surface_hi};
+        background-color: {surface_hi};
         border-radius: 2px;
         /* Side margin so the round handle has room at the extremes
            and isn't clipped by the slider widget's edge. */
         margin: 0 9px;
     }}
     QSlider::sub-page:horizontal {{
-        background: {accent};
+        background-color: {accent};
         border-radius: 2px;
         margin: 0 9px;
     }}
     QSlider::add-page:horizontal {{
-        background: transparent;
+        background-color: {surface_hi};
+        border-radius: 2px;
         margin: 0 9px;
     }}
     QSlider::handle:horizontal {{
-        background: {fg};
+        background-color: {fg};
         width: 16px; height: 16px;
         margin: -6px 0;
         border-radius: 8px;
     }}
-    QSlider::handle:horizontal:hover {{ background: {accent}; }}
-    QSlider:disabled::sub-page:horizontal {{ background: {muted}; }}
-    QSlider:disabled::handle:horizontal {{ background: {border}; }}
+    QSlider::handle:horizontal:hover {{ background-color: {accent}; }}
+    QSlider:disabled::sub-page:horizontal {{ background-color: {muted}; }}
+    QSlider:disabled::handle:horizontal {{ background-color: {border}; }}
 
     QStatusBar {{ background: {surface}; color: {fg}; }}
     QStatusBar QLabel {{ color: {fg}; }}
@@ -1597,6 +1604,9 @@ class MainWindow(QMainWindow):
         self.cpu_slider.setPageStep(1)
         self.cpu_slider.setMinimumWidth(180)
         self.cpu_slider.setToolTip(f"1 – {cpus} CPU threads available")
+        # Force transparent background even when the global QWidget rule
+        # tries to paint over us.
+        self.cpu_slider.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.cpu_value_lbl = QLabel()
         self.cpu_value_lbl.setMinimumWidth(80)
         self.cpu_slider.valueChanged.connect(self._refresh_resource_labels)
@@ -1637,6 +1647,7 @@ class MainWindow(QMainWindow):
         self.ram_cap_slider.setMinimumWidth(180)
         self.ram_cap_slider.setEnabled(self.ram_cap_check.isChecked())
         self.ram_cap_slider.setToolTip(cap_tip)
+        self.ram_cap_slider.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.ram_cap_value_lbl = QLabel()
         self.ram_cap_value_lbl.setMinimumWidth(80)
         self.ram_cap_check.toggled.connect(self.ram_cap_slider.setEnabled)
