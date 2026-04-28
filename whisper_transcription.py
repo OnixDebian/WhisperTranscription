@@ -1782,7 +1782,9 @@ class MainWindow(QMainWindow):
         ):
             self.resize(saved[0], saved[1])
         else:
-            self.resize(720, 820)
+            # New-install default — main window is small now that the
+            # picker and resources moved to Settings.
+            self.resize(610, 605)
         self.current_file: str | None = None
         self._file_queue: list[str] = []
         self._batch_index: int = 0
