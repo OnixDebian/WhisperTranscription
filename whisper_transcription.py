@@ -383,7 +383,8 @@ def build_stylesheet(t: dict) -> str:
     QProgressBar {{
         background: {surface}; color: {fg};
         border: 1px solid {border}; border-radius: 6px;
-        text-align: center; min-height: 18px; font-weight: 600;
+        text-align: center; min-height: 26px;
+        font-weight: 700; font-size: 10pt;
     }}
     QProgressBar::chunk {{ background: {accent}; border-radius: 4px; }}
 
@@ -1122,7 +1123,10 @@ class MainWindow(QMainWindow):
         root.addLayout(btns)
 
         self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("Idle")
         self.progress.setVisible(False)
         root.addWidget(self.progress)
 
@@ -1316,18 +1320,19 @@ class MainWindow(QMainWindow):
         self.worker.start(self.current_file, model_name, cpu_threads, language, ram_cap_gb)
 
     def _on_worker_progress(self, msg: str) -> None:
+        # Status bar mirrors phase, the progress bar shows it inline so
+        # the user has something to read in the bar even when whisper
+        # hasn't ticked tqdm yet (short clips, model download, etc.).
         self.statusBar().showMessage(msg)
-        # New phase (e.g. 'Loading model…' → 'Transcribing…') restarts
-        # tqdm at 0%. Reset the bar to indeterminate until the next
-        # percentage arrives so it doesn't stick at 100% from the
-        # previous phase (model download).
-        self.progress.setRange(0, 0)
+        self._progress_phase = msg
         self.progress.setValue(0)
+        self.progress.setFormat(f"{msg}    0%")
 
     def _on_worker_progress_pct(self, pct: int) -> None:
-        if self.progress.maximum() != 100:
-            self.progress.setRange(0, 100)
-        self.progress.setValue(max(0, min(100, pct)))
+        pct = max(0, min(100, pct))
+        self.progress.setValue(pct)
+        phase = getattr(self, "_progress_phase", "")
+        self.progress.setFormat(f"{phase}    %p%" if phase else "%p%")
 
     def cancel_transcription(self) -> None:
         if self.worker.is_running():
@@ -1341,11 +1346,18 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(running)
         self.progress.setVisible(running)
         if running:
-            # Start indeterminate; flip to percentage once tqdm reports.
-            self.progress.setRange(0, 0)
+            # Always determinate so the bar is visible from frame 0;
+            # custom QSS made the indeterminate state look like an
+            # empty placeholder. The phase text inside the bar tells
+            # the user something is happening before tqdm ticks.
+            self._progress_phase = "Starting…"
+            self.progress.setRange(0, 100)
             self.progress.setValue(0)
+            self.progress.setFormat("Starting…    0%")
             self.model_warning.setVisible(False)
         else:
+            self.progress.setValue(0)
+            self.progress.setFormat("Idle")
             self.model_warning.setVisible(bool(self.model_warning.text()))
 
     def on_transcribe_done(self, result: dict) -> None:
